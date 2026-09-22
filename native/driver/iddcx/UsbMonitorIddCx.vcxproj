@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{D0B2C9F0-9D32-4A13-9E5E-4B2F323C5A1A}</ProjectGuid>
+    <RootNamespace>UsbMonitorIddCx</RootNamespace>
+    <Platform Condition="'$(Platform)' == ''">x64</Platform>
+    <MinimumVisualStudioVersion>17.0</MinimumVisualStudioVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <DriverTargetPlatform>Universal</DriverTargetPlatform>
+    <TargetVersion>Windows10</TargetVersion>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <UMDF_VERSION_MAJOR>2</UMDF_VERSION_MAJOR>
+    <UMDF_VERSION_MINOR>25</UMDF_VERSION_MINOR>
+    <IndirectDisplayDriver>true</IndirectDisplayDriver>
+    <IDDCX_VERSION_MAJOR>1</IDDCX_VERSION_MAJOR>
+    <IDDCX_VERSION_MINOR>4</IDDCX_VERSION_MINOR>
+  </PropertyGroup>
+  <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <DriverTargetPlatform>Universal</DriverTargetPlatform>
+    <TargetVersion>Windows10</TargetVersion>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <UMDF_VERSION_MAJOR>2</UMDF_VERSION_MAJOR>
+    <UMDF_VERSION_MINOR>25</UMDF_VERSION_MINOR>
+    <IndirectDisplayDriver>true</IndirectDisplayDriver>
+    <IDDCX_VERSION_MAJOR>1</IDDCX_VERSION_MAJOR>
+    <IDDCX_VERSION_MINOR>4</IDDCX_VERSION_MINOR>
+  </PropertyGroup>
+  <PropertyGroup>
+    <WDKContentRoot>C:\Program Files (x86)\Windows Kits\10\</WDKContentRoot>
+    <WDKBuildFolder>10.0.26100.0</WDKBuildFolder>
+    <IsUserModeToolset>true</IsUserModeToolset>
+    <DriverType>UMDF</DriverType>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <Import Project="$(WDKContentRoot)build\$(WDKBuildFolder)\x64\WindowsUserModeDriver\WDK.x64.WindowsUserModeDriver.props"
+          Condition="'$(IsUserModeToolset)' == 'true' and Exists('$(WDKContentRoot)build\$(WDKBuildFolder)\x64\WindowsUserModeDriver\WDK.x64.WindowsUserModeDriver.props')" />
+  <Import Project="$(WDKContentRoot)DesignTime\CommonConfiguration\Neutral\WDK\$(TargetPlatformVersion)\WDK.props"
+          Condition="'$(IsUserModeToolset)' == 'true' and Exists('$(WDKContentRoot)DesignTime\CommonConfiguration\Neutral\WDK\$(TargetPlatformVersion)\WDK.props')" />
+  <Import Project="$(WDKContentRoot)build\$(WDKBuildFolder)\WindowsDriver.Default.props"
+          Condition="'$(IsUserModeToolset)' == 'true' and Exists('$(WDKContentRoot)build\$(WDKBuildFolder)\WindowsDriver.Default.props')" />
+  <Import Project="$(WDKContentRoot)build\$(WDKBuildFolder)\x64\ImportAfter\WDK.x64.WindowsUserModeDriver.Platform.props"
+          Condition="'$(IsUserModeToolset)' == 'true' and Exists('$(WDKContentRoot)build\$(WDKBuildFolder)\x64\ImportAfter\WDK.x64.WindowsUserModeDriver.Platform.props')" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <PreprocessorDefinitions>_WIN64;_AMD64_;AMD64;UMDF_DRIVER;IDDCX_VERSION_MAJOR=1;IDDCX_VERSION_MINOR=4;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(WindowsSdkDir)Include\$(TargetPlatformVersion)\shared;$(WindowsSdkDir)Include\$(TargetPlatformVersion)\um;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>OneCoreUAP.lib;avrt.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+    <DriverSign>
+      <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
+    </DriverSign>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <PreprocessorDefinitions>_WIN64;_AMD64_;AMD64;UMDF_DRIVER;IDDCX_VERSION_MAJOR=1;IDDCX_VERSION_MINOR=4;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(WindowsSdkDir)Include\$(TargetPlatformVersion)\shared;$(WindowsSdkDir)Include\$(TargetPlatformVersion)\um;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>OneCoreUAP.lib;avrt.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+    <DriverSign>
+      <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
+    </DriverSign>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="Driver.cpp" />
+    <ClInclude Include="Driver.h" />
+    <Inf Include="UsbMonitorIddCx.inf" />
+    <FilesToPackage Include="$(TargetPath)" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Import Project="$(WDKContentRoot)build\$(WDKBuildFolder)\WindowsDriver.Common.targets"
+          Condition="'$(IsUserModeToolset)' == 'true' and Exists('$(WDKContentRoot)build\$(WDKBuildFolder)\WindowsDriver.Common.targets')" />
+</Project>

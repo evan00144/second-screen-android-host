@@ -1,0 +1,26 @@
+# Native and driver build output
+/build/
+/native/driver/iddcx/x64/
+*.obj
+*.pdb
+*.tlog/
+*.dll
+*.exe
+*.lib
+*.exp
+*.cer
+*.cat
+
+# Android build output
+/apps/android/.gradle/
+/apps/android/build/
+/apps/android/app/build/
+*.apk
+
+# IDE and local files
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+build-driver-msbuild.txt
