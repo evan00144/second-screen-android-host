@@ -14,6 +14,11 @@ final class LatestFrameQueue {
             return;
         }
         if (pending.size() >= MAX_PENDING_FRAMES) {
+            EncodedFrame queued = pending.peekFirst();
+            if (queued != null && queued.randomAccess && !frame.randomAccess) {
+                droppedFrames++;
+                return;
+            }
             pending.removeFirst();
             droppedFrames++;
         }

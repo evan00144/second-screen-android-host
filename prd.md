@@ -1,6 +1,8 @@
 
 # Product Requirements Document
 
+> Implementation status, build instructions, and the active roadmap are maintained in `README.md`, `docs/interaction-latency-spec.md`, and `docs/implementation-plan.md`. This document remains the product vision and architecture reference.
+
 ## USB Second Display for Android — V0.1
 
 **Status:** MVP

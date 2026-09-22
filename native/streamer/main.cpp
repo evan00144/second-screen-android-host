@@ -56,6 +56,9 @@ constexpr size_t kMaxHandshakeBytes = 64 * 1024;
 constexpr int kClientSendBufferBytes = 32 * 1024;
 constexpr int kClientSendTimeoutMs = 2000;
 constexpr uint32_t kPacketMagic = 0x31565353; // bytes: 53 53 56 31 ("SSV1")
+constexpr uint32_t kNvencPicFlagForceIdr = 0x2;
+constexpr uint32_t kNvencPicFlagOutputSpsPps = 0x4;
+constexpr uint64_t kHeartbeatIntervalUs = 1'000'000;
 
 std::atomic_bool g_stop{false};
 std::atomic<SOCKET> g_listener{INVALID_SOCKET};
@@ -632,6 +635,10 @@ public:
         return SendBytes(header.data(), header.size()) && SendBytes(payload, payloadLength);
     }
 
+    bool SendHeartbeat() {
+        return SendAccessUnit(0, 0, nullptr, 0);
+    }
+
     bool SendAnnexB(uint64_t frameId, uint64_t timestampUs, const uint8_t* payload, size_t payloadLength) {
         if (HasAnnexBStartCode(payload, payloadLength)) {
             return SendAccessUnit(frameId, timestampUs, payload, payloadLength);
@@ -842,8 +849,7 @@ public:
             ThrowWin32(mappingError, "CreateFileMappingW(FrameRing)");
         }
         if (mappingError == ERROR_ALREADY_EXISTS) {
-            LocalFree(securityDescriptor);
-            throw std::runtime_error("CreateFileMappingW(FrameRing) found an existing named mapping");
+            std::cerr << "[WARN] reusing existing FrameRing mapping\n";
         }
 
         HANDLE frameReadyEvent = CreateEventW(
@@ -860,7 +866,7 @@ public:
             ThrowWin32(eventError, "CreateEventW(FrameReady)");
         }
         if (eventError == ERROR_ALREADY_EXISTS) {
-            throw std::runtime_error("CreateEventW(FrameReady) found an existing named event");
+            std::cerr << "[WARN] reusing existing FrameReady event\n";
         }
 
         ring_ = static_cast<UsbMonitorFrameRing::FrameRing*>(MapViewOfFile(
@@ -924,6 +930,7 @@ class FrameRingReader final {
 public:
     enum class Result {
         Frame,
+        Heartbeat,
         Stopped,
         Disconnected,
     };
@@ -939,6 +946,7 @@ public:
     Result WaitForFrame(SOCKET socket, CapturedFrame& output) {
         output = {};
         const std::uint64_t waitStartedUs = NowMicros();
+        std::uint64_t nextHeartbeatUs = waitStartedUs + kHeartbeatIntervalUs;
         std::uint64_t nextWaitLogUs = waitStartedUs + 5'000'000;
         while (!g_stop.load()) {
             if (!IsSocketConnected(socket)) {
@@ -966,6 +974,10 @@ public:
                 return Result::Stopped;
             }
             const std::uint64_t nowUs = NowMicros();
+            if (nowUs >= nextHeartbeatUs) {
+                nextHeartbeatUs = nowUs + kHeartbeatIntervalUs;
+                return Result::Heartbeat;
+            }
             if (nowUs >= nextWaitLogUs) {
                 std::cerr << "[CAPTURE] no FrameRing frame for "
                           << ((nowUs - waitStartedUs) / 1'000'000) << " seconds; client still connected\n";
@@ -1602,7 +1614,10 @@ public:
         picture.outputBitstream = bitstreamBuffer_;
         picture.bufferFmt = 1;
         picture.pictureStruct = 1;
-        picture.encodePicFlags = frameIndex == 0 ? 0x6 : 0;
+        const std::uint64_t keyframeInterval = std::max<std::uint64_t>(1, config_.fps / 4);
+        picture.encodePicFlags = frameIndex % keyframeInterval == 0
+            ? kNvencPicFlagForceIdr | kNvencPicFlagOutputSpsPps
+            : 0;
         const NvencStatus encodeStatus = encodePicture(session_, &picture);
         if (encodeStatus == kNvencNeedMoreInput) {
             return true;
@@ -2636,6 +2651,13 @@ void StreamClient(
     while (!g_stop.load() && (config.frames == 0 || encodedFrames < config.frames)) {
         CapturedFrame frame;
         const FrameRingReader::Result result = reader.WaitForFrame(socket, frame);
+        if (result == FrameRingReader::Result::Heartbeat) {
+            if (!writer.SendHeartbeat()) {
+                std::cerr << "[CLIENT] stream stopped: " << writer.error() << '\n';
+                return;
+            }
+            continue;
+        }
         if (result != FrameRingReader::Result::Frame) {
             if (!reader.error().empty()) {
                 std::cerr << "[CLIENT] frame ring stopped: " << reader.error() << '\n';

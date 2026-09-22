@@ -8,9 +8,9 @@ final class StreamStats {
     private final AtomicLong droppedFrames = new AtomicLong();
     private final AtomicLong receivedBytes = new AtomicLong();
     private volatile long lastCaptureTimestampUs;
+    private volatile long lastPacketReceivedNanos;
     private volatile long lastFrameReceivedNanos;
     private volatile long lastDecoderActivityNanos;
-    private volatile long lastSurfaceRenderNanos;
     private volatile long startedNanos = System.nanoTime();
     private volatile int width;
     private volatile int height;
@@ -24,7 +24,13 @@ final class StreamStats {
         receivedFrames.incrementAndGet();
         receivedBytes.addAndGet(bytes);
         lastCaptureTimestampUs = captureTimestampUs;
-        lastFrameReceivedNanos = System.nanoTime();
+        long now = System.nanoTime();
+        lastPacketReceivedNanos = now;
+        lastFrameReceivedNanos = now;
+    }
+
+    void heartbeatReceived() {
+        lastPacketReceivedNanos = System.nanoTime();
     }
 
     void frameDecoded() {
@@ -35,9 +41,6 @@ final class StreamStats {
         lastDecoderActivityNanos = System.nanoTime();
     }
 
-    void frameRendered() {
-        lastSurfaceRenderNanos = System.nanoTime();
-    }
 
     void framesDropped(long count) {
         if (count > 0) {
@@ -63,9 +66,9 @@ final class StreamStats {
                 receivedFrames.get(),
                 decodedFrames.get(),
                 droppedFrames.get(),
+                lastPacketReceivedNanos,
                 lastFrameReceivedNanos,
-                lastDecoderActivityNanos,
-                lastSurfaceRenderNanos);
+                lastDecoderActivityNanos);
     }
 
     static final class Snapshot {
@@ -77,9 +80,9 @@ final class StreamStats {
         final long receivedFrames;
         final long decodedFrames;
         final long droppedFrames;
+        final long lastPacketReceivedNanos;
         final long lastFrameReceivedNanos;
         final long lastDecoderActivityNanos;
-        final long lastSurfaceRenderNanos;
 
         Snapshot(
                 int width,
@@ -90,9 +93,9 @@ final class StreamStats {
                 long receivedFrames,
                 long decodedFrames,
                 long droppedFrames,
+                long lastPacketReceivedNanos,
                 long lastFrameReceivedNanos,
-                long lastDecoderActivityNanos,
-                long lastSurfaceRenderNanos) {
+                long lastDecoderActivityNanos) {
             this.width = width;
             this.height = height;
             this.fps = fps;
@@ -101,9 +104,9 @@ final class StreamStats {
             this.receivedFrames = receivedFrames;
             this.decodedFrames = decodedFrames;
             this.droppedFrames = droppedFrames;
+            this.lastPacketReceivedNanos = lastPacketReceivedNanos;
             this.lastFrameReceivedNanos = lastFrameReceivedNanos;
             this.lastDecoderActivityNanos = lastDecoderActivityNanos;
-            this.lastSurfaceRenderNanos = lastSurfaceRenderNanos;
         }
     }
 }

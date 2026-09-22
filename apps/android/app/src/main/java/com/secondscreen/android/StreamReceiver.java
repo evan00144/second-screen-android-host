@@ -43,7 +43,7 @@ final class StreamReceiver {
 
     void run() throws IOException {
         VideoDecoder decoder = new VideoDecoder(connectionInfo, surface, stats);
-        EncodedFrame firstFrame = readPacket(input);
+        EncodedFrame firstFrame = readVideoPacket(input);
         stats.packetReceived(firstFrame.accessUnit.length, firstFrame.captureTimestampUs);
         decoder.start(firstFrame.accessUnit);
         decoderThread = new Thread(() -> decodeLoop(decoder), "second-screen-decoder");
@@ -61,6 +61,10 @@ final class StreamReceiver {
                     throw asIOException("H.264 decoder stopped", failure);
                 }
                 EncodedFrame frame = readPacket(input);
+                if (frame.heartbeat) {
+                    stats.heartbeatReceived();
+                    continue;
+                }
                 stats.packetReceived(frame.accessUnit.length, frame.captureTimestampUs);
                 queue.offer(frame);
                 stats.framesDropped(queue.takeDroppedFrames());
@@ -136,22 +140,20 @@ final class StreamReceiver {
                 }
                 StreamStats.Snapshot snapshot = stats.snapshot();
                 long now = System.nanoTime();
-                if (now - snapshot.lastFrameReceivedNanos > STALL_TIMEOUT_NANOS) {
-                    failStream("No video packet received for 5 seconds");
+                if (snapshot.lastPacketReceivedNanos == 0
+                        || now - snapshot.lastPacketReceivedNanos > STALL_TIMEOUT_NANOS) {
+                    failStream("No stream packet received for 5 seconds");
                     return;
                 }
-                if (snapshot.receivedFrames > 1
+                boolean recentVideo = snapshot.lastFrameReceivedNanos != 0
+                        && now - snapshot.lastFrameReceivedNanos <= STALL_TIMEOUT_NANOS;
+                if (recentVideo && snapshot.receivedFrames > 1
                         && (snapshot.lastDecoderActivityNanos == 0
                         || now - snapshot.lastDecoderActivityNanos > STALL_TIMEOUT_NANOS)) {
                     failStream("Video decoder stopped processing for 5 seconds");
                     return;
                 }
-                if (snapshot.decodedFrames > 1
-                        && (snapshot.lastSurfaceRenderNanos == 0
-                        || now - snapshot.lastSurfaceRenderNanos > STALL_TIMEOUT_NANOS)) {
-                    failStream("Video surface stopped rendering for 5 seconds");
-                    return;
-                }
+
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -198,15 +200,35 @@ final class StreamReceiver {
                     "Invalid SSV1 packet magic 0x%08x (expected 0x%08x)", magic, MAGIC));
         }
         long unsignedLength = Integer.toUnsignedLong(buffer.getInt());
-        if (unsignedLength <= 0 || unsignedLength > MAX_ACCESS_UNIT_BYTES) {
+        if (unsignedLength > MAX_ACCESS_UNIT_BYTES) {
             throw new ProtocolException("Invalid SSV1 access-unit length: " + unsignedLength
                     + " (maximum " + MAX_ACCESS_UNIT_BYTES + ")");
         }
         long frameId = buffer.getLong();
         long captureTimestampUs = buffer.getLong();
+        if (unsignedLength == 0) {
+            if (frameId != 0) {
+                throw new ProtocolException("Invalid SSV1 heartbeat frame ID: " + frameId);
+            }
+            return new EncodedFrame(frameId, captureTimestampUs, false, true, new byte[0]);
+        }
         byte[] accessUnit = new byte[(int) unsignedLength];
         readFully(input, accessUnit, 0, accessUnit.length);
-        return new EncodedFrame(frameId, captureTimestampUs, VideoDecoder.findNalUnit(accessUnit, 5) != null, accessUnit);
+        return new EncodedFrame(
+                frameId,
+                captureTimestampUs,
+                VideoDecoder.findNalUnit(accessUnit, 5) != null,
+                false,
+                accessUnit);
+    }
+
+    private static EncodedFrame readVideoPacket(InputStream input) throws IOException {
+        while (true) {
+            EncodedFrame frame = readPacket(input);
+            if (!frame.heartbeat) {
+                return frame;
+            }
+        }
     }
 
     private static void readFully(InputStream input, byte[] buffer, int offset, int length)
