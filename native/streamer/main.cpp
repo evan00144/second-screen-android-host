@@ -617,6 +617,8 @@ bool ReadHandshake(SOCKET socket, std::string& line, std::string& error) {
     return false;
 }
 
+std::uint64_t NowMicros();
+
 class PacketWriter {
 public:
     PacketWriter() = default;
@@ -632,7 +634,29 @@ public:
         WriteLe32(header.data() + 4, static_cast<uint32_t>(payloadLength));
         WriteLe64(header.data() + 8, frameId);
         WriteLe64(header.data() + 16, timestampUs);
-        return SendBytes(header.data(), header.size()) && SendBytes(payload, payloadLength);
+        const std::uint64_t sendStartedUs = NowMicros();
+        const bool sent = SendBytes(header.data(), header.size()) && SendBytes(payload, payloadLength);
+        const std::uint64_t sendDurationUs = NowMicros() - sendStartedUs;
+        sendTimeTotalUs_ += sendDurationUs;
+        sendTimeMaxUs_ = std::max(sendTimeMaxUs_, sendDurationUs);
+        ++sendTimeSamples_;
+        if (!sent) {
+            ++sendFailures_;
+            if (error_.find("timed out") != std::string::npos) {
+                ++sendTimeouts_;
+            }
+            return false;
+        }
+        if (frameId == 0 && payloadLength == 0) {
+            ++heartbeatPacketsSent_;
+        } else {
+            ++videoPacketsSent_;
+            videoBytesSent_ += payloadLength;
+            if (ContainsNalType(payload, payloadLength, 5)) {
+                ++idrPacketsSent_;
+            }
+        }
+        return true;
     }
 
     bool SendHeartbeat() {
@@ -659,10 +683,28 @@ public:
     }
 
     const std::string& error() const { return error_; }
+    std::uint64_t videoPacketsSent() const { return videoPacketsSent_; }
+    std::uint64_t idrPacketsSent() const { return idrPacketsSent_; }
+    std::uint64_t videoBytesSent() const { return videoBytesSent_; }
+    std::uint64_t heartbeatPacketsSent() const { return heartbeatPacketsSent_; }
+    std::uint64_t sendFailures() const { return sendFailures_; }
+    std::uint64_t sendTimeouts() const { return sendTimeouts_; }
+    std::uint64_t sendTimeTotalUs() const { return sendTimeTotalUs_; }
+    std::uint64_t sendTimeMaxUs() const { return sendTimeMaxUs_; }
+    std::uint64_t sendTimeSamples() const { return sendTimeSamples_; }
 
 private:
     SOCKET socket_ = INVALID_SOCKET;
     std::string error_;
+    std::uint64_t videoPacketsSent_ = 0;
+    std::uint64_t idrPacketsSent_ = 0;
+    std::uint64_t videoBytesSent_ = 0;
+    std::uint64_t heartbeatPacketsSent_ = 0;
+    std::uint64_t sendFailures_ = 0;
+    std::uint64_t sendTimeouts_ = 0;
+    std::uint64_t sendTimeTotalUs_ = 0;
+    std::uint64_t sendTimeMaxUs_ = 0;
+    std::uint64_t sendTimeSamples_ = 0;
 
     static void WriteLe32(uint8_t* destination, uint32_t value) {
         for (unsigned i = 0; i < 4; ++i) {
@@ -679,6 +721,23 @@ private:
     static bool HasAnnexBStartCode(const uint8_t* payload, size_t length) {
         return length >= 3 && payload[0] == 0 && payload[1] == 0 &&
             ((payload[2] == 1) || (length >= 4 && payload[2] == 0 && payload[3] == 1));
+    }
+
+    static bool ContainsNalType(const uint8_t* payload, size_t length, uint8_t requestedType) {
+        for (size_t index = 0; index + 3 < length; ++index) {
+            size_t startCodeLength = 0;
+            if (payload[index] == 0 && payload[index + 1] == 0 && payload[index + 2] == 1) {
+                startCodeLength = 3;
+            } else if (index + 4 <= length && payload[index] == 0 && payload[index + 1] == 0 &&
+                       payload[index + 2] == 0 && payload[index + 3] == 1) {
+                startCodeLength = 4;
+            }
+            if (startCodeLength != 0 && index + startCodeLength < length &&
+                (payload[index + startCodeLength] & 0x1f) == requestedType) {
+                return true;
+            }
+        }
+        return false;
     }
 
     static bool ConvertLengthPrefixed(const uint8_t* payload, size_t length, std::vector<uint8_t>& output) {
@@ -926,6 +985,11 @@ struct CapturedFrame {
     std::uint64_t captureTimestampUs = 0;
 };
 
+struct FrameRingStats {
+    std::uint64_t framesRead = 0;
+    std::uint64_t framesSkipped = 0;
+};
+
 class FrameRingReader final {
 public:
     enum class Result {
@@ -941,6 +1005,13 @@ public:
 
     void BeginClient(std::uint32_t width, std::uint32_t height) {
         replayCachedFrame_ = hasCachedFrame_ && cachedWidth_ == width && cachedHeight_ == height;
+        framesRead_ = 0;
+        framesSkipped_ = 0;
+        lastConsumedFrameId_ = 0;
+    }
+
+    FrameRingStats stats() const {
+        return {framesRead_, framesSkipped_};
     }
 
     Result WaitForFrame(SOCKET socket, CapturedFrame& output) {
@@ -1001,6 +1072,9 @@ private:
     std::uint32_t cachedStride_ = 0;
     std::uint64_t cachedFrameId_ = 0;
     std::uint64_t cachedCaptureTimestampUs_ = 0;
+    std::uint64_t framesRead_ = 0;
+    std::uint64_t framesSkipped_ = 0;
+    std::uint64_t lastConsumedFrameId_ = 0;
 
     static bool IsSocketConnected(SOCKET socket) {
         fd_set readSet;
@@ -1148,6 +1222,11 @@ private:
             cachedFrameId_ = selected.frameId;
             cachedCaptureTimestampUs_ = selected.captureTimestampUs;
             hasCachedFrame_ = true;
+            if (lastConsumedFrameId_ != 0 && selected.frameId > lastConsumedFrameId_ + 1) {
+                framesSkipped_ += selected.frameId - lastConsumedFrameId_ - 1;
+            }
+            lastConsumedFrameId_ = selected.frameId;
+            ++framesRead_;
             SetCachedFrame(output);
             FreeSlot(selected);
             return true;
@@ -2635,6 +2714,77 @@ void StreamClient(
     H264Encoder encoder(effectiveConfig);
     encoder.Initialize();
     PacketWriter writer(socket);
+    std::uint64_t encodeCallTotalUs = 0;
+    std::uint64_t encodeCallMaxUs = 0;
+    std::uint64_t encodeCallSamples = 0;
+    const auto encodeFrame = [&](const CapturedFrame& frame) {
+        const std::uint64_t startedUs = NowMicros();
+        const bool encoded = encoder.EncodeFrame(writer, frame);
+        const std::uint64_t durationUs = NowMicros() - startedUs;
+        encodeCallTotalUs += durationUs;
+        encodeCallMaxUs = std::max(encodeCallMaxUs, durationUs);
+        ++encodeCallSamples;
+        return encoded;
+    };
+    std::uint64_t nextStatsLogUs = NowMicros() + 5'000'000;
+    std::uint64_t previousStatsUs = nextStatsLogUs - 5'000'000;
+    std::uint64_t previousCapture = 0;
+    std::uint64_t previousSkipped = 0;
+    std::uint64_t previousVideo = 0;
+    std::uint64_t previousBytes = 0;
+    std::uint64_t previousHeartbeats = 0;
+    std::uint64_t previousEncodeCallTotalUs = 0;
+    std::uint64_t previousEncodeCallSamples = 0;
+    std::uint64_t previousSendTimeTotalUs = 0;
+    std::uint64_t previousSendTimeSamples = 0;
+    const auto logStats = [&]() {
+        const std::uint64_t nowUs = NowMicros();
+        if (nowUs < nextStatsLogUs) {
+            return;
+        }
+        const FrameRingStats ringStats = reader.stats();
+        const double elapsedSeconds = std::max<std::uint64_t>(1, nowUs - previousStatsUs) / 1'000'000.0;
+        const std::uint64_t captureDelta = ringStats.framesRead - previousCapture;
+        const std::uint64_t skippedDelta = ringStats.framesSkipped - previousSkipped;
+        const std::uint64_t videoDelta = writer.videoPacketsSent() - previousVideo;
+        const std::uint64_t bytesDelta = writer.videoBytesSent() - previousBytes;
+        const std::uint64_t heartbeatDelta = writer.heartbeatPacketsSent() - previousHeartbeats;
+        const std::uint64_t encodeSamplesDelta = encodeCallSamples - previousEncodeCallSamples;
+        const std::uint64_t sendSamplesDelta = writer.sendTimeSamples() - previousSendTimeSamples;
+        const std::uint64_t encodeTimeDelta = encodeCallTotalUs - previousEncodeCallTotalUs;
+        const std::uint64_t sendTimeDelta = writer.sendTimeTotalUs() - previousSendTimeTotalUs;
+        std::cout << "[STATS] capture=" << ringStats.framesRead
+                  << " skipped=" << ringStats.framesSkipped
+                  << " video=" << writer.videoPacketsSent()
+                  << " idr=" << writer.idrPacketsSent()
+                  << " bytes=" << writer.videoBytesSent()
+                  << " heartbeat=" << writer.heartbeatPacketsSent()
+                  << " send_fail=" << writer.sendFailures()
+                  << " send_timeout=" << writer.sendTimeouts()
+                  << " window_s=" << elapsedSeconds
+                  << " capture_fps=" << captureDelta / elapsedSeconds
+                  << " video_fps=" << videoDelta / elapsedSeconds
+                  << " skipped_delta=" << skippedDelta
+                  << " bytes_mbps=" << bytesDelta * 8.0 / elapsedSeconds / 1'000'000.0
+                  << " heartbeat_delta=" << heartbeatDelta
+                  << " encode_call_avg_ms="
+                  << (encodeSamplesDelta == 0 ? 0.0 : encodeTimeDelta / encodeSamplesDelta / 1'000.0)
+                  << " encode_call_max_ms=" << encodeCallMaxUs / 1'000.0
+                  << " send_avg_ms="
+                  << (sendSamplesDelta == 0 ? 0.0 : sendTimeDelta / sendSamplesDelta / 1'000.0)
+                  << " send_max_ms=" << writer.sendTimeMaxUs() / 1'000.0 << '\n';
+        previousStatsUs = nowUs;
+        previousCapture = ringStats.framesRead;
+        previousSkipped = ringStats.framesSkipped;
+        previousVideo = writer.videoPacketsSent();
+        previousBytes = writer.videoBytesSent();
+        previousHeartbeats = writer.heartbeatPacketsSent();
+        previousEncodeCallTotalUs = encodeCallTotalUs;
+        previousEncodeCallSamples = encodeCallSamples;
+        previousSendTimeTotalUs = writer.sendTimeTotalUs();
+        previousSendTimeSamples = writer.sendTimeSamples();
+        nextStatsLogUs = nowUs + 5'000'000;
+    };
     if (!SendHandshakeResponse(socket, effectiveConfig, handshakeError)) {
         std::cerr << "[CLIENT] handshake response failed: " << handshakeError << '\n';
         return;
@@ -2642,11 +2792,12 @@ void StreamClient(
     std::cout << "[CLIENT] connected: " << request.device << " (requested " << request.width << 'x' << request.height
               << ", streaming " << effectiveConfig.width << 'x' << effectiveConfig.height << ")\n";
     if (!g_stop.load() && (config.frames == 0 || encodedFrames < config.frames)) {
-        if (!encoder.EncodeFrame(writer, firstFrame)) {
+        if (!encodeFrame(firstFrame)) {
             std::cerr << "[CLIENT] stream stopped: " << writer.error() << '\n';
             return;
         }
         ++encodedFrames;
+        logStats();
     }
     while (!g_stop.load() && (config.frames == 0 || encodedFrames < config.frames)) {
         CapturedFrame frame;
@@ -2656,6 +2807,7 @@ void StreamClient(
                 std::cerr << "[CLIENT] stream stopped: " << writer.error() << '\n';
                 return;
             }
+            logStats();
             continue;
         }
         if (result != FrameRingReader::Result::Frame) {
@@ -2666,11 +2818,12 @@ void StreamClient(
             }
             return;
         }
-        if (!encoder.EncodeFrame(writer, frame)) {
+        if (!encodeFrame(frame)) {
             std::cerr << "[CLIENT] stream stopped: " << writer.error() << '\n';
             return;
         }
         ++encodedFrames;
+        logStats();
     }
     if (!g_stop.load() && !encoder.Drain(writer)) {
         std::cerr << "[CLIENT] drain stopped: " << writer.error() << '\n';

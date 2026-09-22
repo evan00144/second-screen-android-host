@@ -23,6 +23,7 @@ The current transport uses `adb reverse`. Native USB transport and Android touch
 - `prd.md`: Product vision and original architecture.
 - `docs/interaction-latency-spec.md`: Next latency objective and acceptance criteria.
 - `docs/implementation-plan.md`: Ordered implementation plan.
+- `docs/latency-test-plan.md`: Repeatable 30/60 FPS latency test procedure.
 
 ## Requirements
 

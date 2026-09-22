@@ -3,7 +3,7 @@ package com.secondscreen.android;
 import java.util.ArrayDeque;
 
 final class LatestFrameQueue {
-    private static final int MAX_PENDING_FRAMES = 1;
+    private static final int MAX_PENDING_FRAMES = 2;
 
     private final ArrayDeque<EncodedFrame> pending = new ArrayDeque<>();
     private long droppedFrames;

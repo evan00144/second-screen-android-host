@@ -1,12 +1,21 @@
 package com.secondscreen.android;
 
+import java.util.Locale;
 import java.util.concurrent.atomic.AtomicLong;
 
 final class StreamStats {
-    private final AtomicLong receivedFrames = new AtomicLong();
+    private final AtomicLong videoPacketsReceived = new AtomicLong();
+    private final AtomicLong idrPacketsReceived = new AtomicLong();
     private final AtomicLong decodedFrames = new AtomicLong();
-    private final AtomicLong droppedFrames = new AtomicLong();
+    private final AtomicLong queueDrops = new AtomicLong();
+    private final AtomicLong framesSubmitted = new AtomicLong();
+    private final AtomicLong decoderInputStarvation = new AtomicLong();
+    private final AtomicLong heartbeatPackets = new AtomicLong();
     private final AtomicLong receivedBytes = new AtomicLong();
+    private final AtomicLong queueDelaySamples = new AtomicLong();
+    private final AtomicLong queueDelayNanosTotal = new AtomicLong();
+    private final AtomicLong queueDelayNanosMax = new AtomicLong();
+    private final AtomicLong reconnectCount = new AtomicLong();
     private volatile long lastCaptureTimestampUs;
     private volatile long lastPacketReceivedNanos;
     private volatile long lastFrameReceivedNanos;
@@ -14,14 +23,34 @@ final class StreamStats {
     private volatile long startedNanos = System.nanoTime();
     private volatile int width;
     private volatile int height;
+    private volatile String lastReconnectReason = "none";
 
-    void setFormat(int width, int height) {
+    void beginStream(int width, int height) {
         this.width = width;
         this.height = height;
+        videoPacketsReceived.set(0);
+        idrPacketsReceived.set(0);
+        decodedFrames.set(0);
+        queueDrops.set(0);
+        framesSubmitted.set(0);
+        decoderInputStarvation.set(0);
+        heartbeatPackets.set(0);
+        receivedBytes.set(0);
+        queueDelaySamples.set(0);
+        queueDelayNanosTotal.set(0);
+        queueDelayNanosMax.set(0);
+        lastCaptureTimestampUs = 0;
+        lastPacketReceivedNanos = 0;
+        lastFrameReceivedNanos = 0;
+        lastDecoderActivityNanos = 0;
+        startedNanos = System.nanoTime();
     }
 
-    void packetReceived(int bytes, long captureTimestampUs) {
-        receivedFrames.incrementAndGet();
+    void packetReceived(int bytes, long captureTimestampUs, boolean randomAccess) {
+        videoPacketsReceived.incrementAndGet();
+        if (randomAccess) {
+            idrPacketsReceived.incrementAndGet();
+        }
         receivedBytes.addAndGet(bytes);
         lastCaptureTimestampUs = captureTimestampUs;
         long now = System.nanoTime();
@@ -30,6 +59,7 @@ final class StreamStats {
     }
 
     void heartbeatReceived() {
+        heartbeatPackets.incrementAndGet();
         lastPacketReceivedNanos = System.nanoTime();
     }
 
@@ -41,11 +71,29 @@ final class StreamStats {
         lastDecoderActivityNanos = System.nanoTime();
     }
 
+    void frameSubmitted(long queueDelayNanos) {
+        framesSubmitted.incrementAndGet();
+        if (queueDelayNanos >= 0) {
+            queueDelaySamples.incrementAndGet();
+            queueDelayNanosTotal.addAndGet(queueDelayNanos);
+            queueDelayNanosMax.accumulateAndGet(queueDelayNanos, Math::max);
+        }
+    }
+
+    void decoderInputStarved() {
+        decoderInputStarvation.incrementAndGet();
+    }
 
     void framesDropped(long count) {
         if (count > 0) {
-            droppedFrames.addAndGet(count);
+            queueDrops.addAndGet(count);
         }
+    }
+
+    void reconnect(String reason) {
+        reconnectCount.incrementAndGet();
+        String normalized = reason == null ? "unknown" : reason.replace('\n', ' ').replace('\r', ' ');
+        lastReconnectReason = normalized.isEmpty() ? "unknown" : normalized;
     }
 
     Snapshot snapshot() {
@@ -55,7 +103,6 @@ final class StreamStats {
         double fps = decodedFrames.get() / seconds;
         double bitrate = receivedBytes.get() * 8.0 / seconds;
 
-        // Host timestamps use QPC/boot time; Android wall-clock time is not comparable.
         long latencyMs = -1L;
         return new Snapshot(
                 width,
@@ -63,9 +110,18 @@ final class StreamStats {
                 fps,
                 bitrate,
                 latencyMs,
-                receivedFrames.get(),
+                videoPacketsReceived.get(),
+                idrPacketsReceived.get(),
                 decodedFrames.get(),
-                droppedFrames.get(),
+                queueDrops.get(),
+                framesSubmitted.get(),
+                decoderInputStarvation.get(),
+                heartbeatPackets.get(),
+                reconnectCount.get(),
+                lastReconnectReason,
+                queueDelaySamples.get(),
+                queueDelayNanosTotal.get(),
+                queueDelayNanosMax.get(),
                 lastPacketReceivedNanos,
                 lastFrameReceivedNanos,
                 lastDecoderActivityNanos);
@@ -77,9 +133,18 @@ final class StreamStats {
         final double fps;
         final double bitrate;
         final long latencyMs;
-        final long receivedFrames;
+        final long videoPacketsReceived;
+        final long idrPacketsReceived;
         final long decodedFrames;
         final long droppedFrames;
+        final long framesSubmitted;
+        final long decoderInputStarvation;
+        final long heartbeatPackets;
+        final long reconnectCount;
+        final String lastReconnectReason;
+        final long queueDelaySamples;
+        final long queueDelayNanosTotal;
+        final long queueDelayNanosMax;
         final long lastPacketReceivedNanos;
         final long lastFrameReceivedNanos;
         final long lastDecoderActivityNanos;
@@ -90,9 +155,18 @@ final class StreamStats {
                 double fps,
                 double bitrate,
                 long latencyMs,
-                long receivedFrames,
+                long videoPacketsReceived,
+                long idrPacketsReceived,
                 long decodedFrames,
                 long droppedFrames,
+                long framesSubmitted,
+                long decoderInputStarvation,
+                long heartbeatPackets,
+                long reconnectCount,
+                String lastReconnectReason,
+                long queueDelaySamples,
+                long queueDelayNanosTotal,
+                long queueDelayNanosMax,
                 long lastPacketReceivedNanos,
                 long lastFrameReceivedNanos,
                 long lastDecoderActivityNanos) {
@@ -101,12 +175,61 @@ final class StreamStats {
             this.fps = fps;
             this.bitrate = bitrate;
             this.latencyMs = latencyMs;
-            this.receivedFrames = receivedFrames;
+            this.videoPacketsReceived = videoPacketsReceived;
+            this.idrPacketsReceived = idrPacketsReceived;
             this.decodedFrames = decodedFrames;
             this.droppedFrames = droppedFrames;
+            this.framesSubmitted = framesSubmitted;
+            this.decoderInputStarvation = decoderInputStarvation;
+            this.heartbeatPackets = heartbeatPackets;
+            this.reconnectCount = reconnectCount;
+            this.lastReconnectReason = lastReconnectReason;
+            this.queueDelaySamples = queueDelaySamples;
+            this.queueDelayNanosTotal = queueDelayNanosTotal;
+            this.queueDelayNanosMax = queueDelayNanosMax;
             this.lastPacketReceivedNanos = lastPacketReceivedNanos;
             this.lastFrameReceivedNanos = lastFrameReceivedNanos;
             this.lastDecoderActivityNanos = lastDecoderActivityNanos;
+        }
+
+        String toLogLine(Snapshot previous, long elapsedNanos) {
+            String reason = lastReconnectReason.replace('"', '\'');
+            double elapsedSeconds = Math.max(1L, elapsedNanos) / 1_000_000_000.0;
+            long receivedDelta = videoPacketsReceived - previous.videoPacketsReceived;
+            long submittedDelta = framesSubmitted - previous.framesSubmitted;
+            long decodedDelta = decodedFrames - previous.decodedFrames;
+            long droppedDelta = droppedFrames - previous.droppedFrames;
+            long heartbeatDelta = heartbeatPackets - previous.heartbeatPackets;
+            long queueSamplesDelta = queueDelaySamples - previous.queueDelaySamples;
+            long queueNanosDelta = queueDelayNanosTotal - previous.queueDelayNanosTotal;
+            double queueAverageMs = queueSamplesDelta <= 0
+                    ? 0.0
+                    : queueNanosDelta / (queueSamplesDelta * 1_000_000.0);
+            return String.format(Locale.US,
+                    "[STATS] video=%d idr=%d queue_drop=%d submitted=%d input_starvation=%d "
+                            + "decoded=%d heartbeat=%d reconnect=%d last_reconnect=\"%s\" "
+                            + "fps=%.1f bitrate=%.1fMbps window_s=%.1f recv_fps=%.1f "
+                            + "submit_fps=%.1f decode_fps=%.1f drop_delta=%d heartbeat_delta=%d "
+                            + "queue_avg_ms=%.1f queue_max_ms=%.1f",
+                    videoPacketsReceived,
+                    idrPacketsReceived,
+                    droppedFrames,
+                    framesSubmitted,
+                    decoderInputStarvation,
+                    decodedFrames,
+                    heartbeatPackets,
+                    reconnectCount,
+                    reason,
+                    fps,
+                    bitrate / 1_000_000.0,
+                    elapsedSeconds,
+                    receivedDelta / elapsedSeconds,
+                    submittedDelta / elapsedSeconds,
+                    decodedDelta / elapsedSeconds,
+                    droppedDelta,
+                    heartbeatDelta,
+                    queueAverageMs,
+                    queueDelayNanosMax / 1_000_000.0);
         }
     }
 }

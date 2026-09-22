@@ -36,10 +36,13 @@ Exit condition: a freeze or latency spike can be assigned to capture, encode, tr
 
 ## Phase 2: Measure Interaction Latency
 
+Status: instrumentation complete; camera measurements pending.
+
 - Record a 60 FPS and, when available, 120/240 FPS camera test.
 - Test mouse motion, window dragging, typing, and scrolling.
 - Record P50 and P95 results for 30 FPS and 60 FPS configurations.
 - Keep 1920x1200 at 8 Mbps as the comparison baseline.
+- Use `docs/latency-test-plan.md` for the repeatable procedure.
 
 Exit condition: one reproducible test table identifies the dominant stage.
 

@@ -20,31 +20,41 @@ final class StreamReceiver {
     private static final int MAX_ACCESS_UNIT_BYTES = 16 * 1024 * 1024;
     private static final long WATCHDOG_INTERVAL_MS = 1_000L;
     private static final long STALL_TIMEOUT_NANOS = 5_000_000_000L;
+    private static final long STATS_INTERVAL_NANOS = 5_000_000_000L;
 
     private final Socket socket;
     private final InputStream input;
     private final Surface surface;
     private final ConnectionInfo connectionInfo;
     private final LatestFrameQueue queue = new LatestFrameQueue();
-    private final StreamStats stats = new StreamStats();
+    private final StreamStats stats;
     private final AtomicReference<Throwable> decoderFailure = new AtomicReference<>();
     private volatile boolean closed;
     private volatile boolean stopRequested;
     private Thread decoderThread;
     private Thread watchdogThread;
 
-    StreamReceiver(Socket socket, InputStream input, Surface surface, ConnectionInfo connectionInfo) {
+    StreamReceiver(
+            Socket socket,
+            InputStream input,
+            Surface surface,
+            ConnectionInfo connectionInfo,
+            StreamStats stats) {
         this.socket = socket;
         this.input = input;
         this.surface = surface;
         this.connectionInfo = connectionInfo;
-        stats.setFormat(connectionInfo.width, connectionInfo.height);
+        this.stats = stats;
+        stats.beginStream(connectionInfo.width, connectionInfo.height);
     }
 
     void run() throws IOException {
         VideoDecoder decoder = new VideoDecoder(connectionInfo, surface, stats);
         EncodedFrame firstFrame = readVideoPacket(input);
-        stats.packetReceived(firstFrame.accessUnit.length, firstFrame.captureTimestampUs);
+        stats.packetReceived(
+                firstFrame.accessUnit.length,
+                firstFrame.captureTimestampUs,
+                firstFrame.randomAccess);
         decoder.start(firstFrame.accessUnit);
         decoderThread = new Thread(() -> decodeLoop(decoder), "second-screen-decoder");
         decoderThread.start();
@@ -65,7 +75,10 @@ final class StreamReceiver {
                     stats.heartbeatReceived();
                     continue;
                 }
-                stats.packetReceived(frame.accessUnit.length, frame.captureTimestampUs);
+                stats.packetReceived(
+                        frame.accessUnit.length,
+                        frame.captureTimestampUs,
+                        frame.randomAccess);
                 queue.offer(frame);
                 stats.framesDropped(queue.takeDroppedFrames());
             }
@@ -132,6 +145,9 @@ final class StreamReceiver {
     }
 
     private void watchdogLoop() {
+        long nextStatsLogNanos = System.nanoTime() + STATS_INTERVAL_NANOS;
+        StreamStats.Snapshot previousStats = stats.snapshot();
+        long previousStatsNanos = System.nanoTime();
         try {
             while (!closed) {
                 Thread.sleep(WATCHDOG_INTERVAL_MS);
@@ -140,6 +156,12 @@ final class StreamReceiver {
                 }
                 StreamStats.Snapshot snapshot = stats.snapshot();
                 long now = System.nanoTime();
+                if (now >= nextStatsLogNanos) {
+                    Log.i(TAG, snapshot.toLogLine(previousStats, now - previousStatsNanos));
+                    previousStats = snapshot;
+                    previousStatsNanos = now;
+                    nextStatsLogNanos = now + STATS_INTERVAL_NANOS;
+                }
                 if (snapshot.lastPacketReceivedNanos == 0
                         || now - snapshot.lastPacketReceivedNanos > STALL_TIMEOUT_NANOS) {
                     failStream("No stream packet received for 5 seconds");
@@ -147,7 +169,7 @@ final class StreamReceiver {
                 }
                 boolean recentVideo = snapshot.lastFrameReceivedNanos != 0
                         && now - snapshot.lastFrameReceivedNanos <= STALL_TIMEOUT_NANOS;
-                if (recentVideo && snapshot.receivedFrames > 1
+                if (recentVideo && snapshot.videoPacketsReceived > 1
                         && (snapshot.lastDecoderActivityNanos == 0
                         || now - snapshot.lastDecoderActivityNanos > STALL_TIMEOUT_NANOS)) {
                     failStream("Video decoder stopped processing for 5 seconds");
@@ -210,13 +232,20 @@ final class StreamReceiver {
             if (frameId != 0) {
                 throw new ProtocolException("Invalid SSV1 heartbeat frame ID: " + frameId);
             }
-            return new EncodedFrame(frameId, captureTimestampUs, false, true, new byte[0]);
+            return new EncodedFrame(
+                    frameId,
+                    captureTimestampUs,
+                    System.nanoTime(),
+                    false,
+                    true,
+                    new byte[0]);
         }
         byte[] accessUnit = new byte[(int) unsignedLength];
         readFully(input, accessUnit, 0, accessUnit.length);
         return new EncodedFrame(
                 frameId,
                 captureTimestampUs,
+                System.nanoTime(),
                 VideoDecoder.findNalUnit(accessUnit, 5) != null,
                 false,
                 accessUnit);

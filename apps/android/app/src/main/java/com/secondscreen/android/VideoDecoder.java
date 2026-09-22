@@ -126,6 +126,7 @@ final class VideoDecoder {
             throw new IOException("MediaCodec input dequeue failed: " + e.getMessage(), e);
         }
         if (inputIndex < 0) {
+            stats.decoderInputStarved();
             return false;
         }
 
@@ -144,6 +145,7 @@ final class VideoDecoder {
             long presentationTimeUs = Math.max(lastPresentationTimeUs + 1L, nowUs);
             codec.queueInputBuffer(inputIndex, 0, frame.accessUnit.length, presentationTimeUs, 0);
             lastPresentationTimeUs = presentationTimeUs;
+            stats.frameSubmitted(Math.max(0L, System.nanoTime() - frame.receivedNanos));
         } catch (RuntimeException e) {
             throw new IOException("MediaCodec input queue failed: " + e.getMessage(), e);
         }

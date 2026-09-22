@@ -46,7 +46,8 @@ final class ConnectionManager {
     private volatile Surface surface;
     private volatile Socket activeSocket;
     private volatile StreamReceiver activeReceiver;
-    private volatile StreamStats.Snapshot latestStats;
+    private final StreamStats stats = new StreamStats();
+    private volatile boolean streamStarted;
     private long generation;
     private boolean running;
     private boolean closed;
@@ -105,18 +106,13 @@ final class ConnectionManager {
     }
 
     StreamStats.Snapshot getStats() {
-        StreamReceiver receiver = activeReceiver;
-        if (receiver != null) {
-            StreamStats.Snapshot snapshot = receiver.getStats();
-            latestStats = snapshot;
-            return snapshot;
-        }
-        return latestStats;
+        return streamStarted ? stats.snapshot() : null;
     }
 
     private void runConnectionLoop(long token) {
         while (isCurrent(token)) {
             StreamReceiver receiver = null;
+            String reconnectReason = null;
             try {
                 notifyConnecting(token);
                 Socket socket = connectSocket();
@@ -127,18 +123,20 @@ final class ConnectionManager {
                     closeQuietly(socket);
                     return;
                 }
-                receiver = new StreamReceiver(socket, input, surface, info);
+                receiver = new StreamReceiver(socket, input, surface, info, stats);
                 activeReceiver = receiver;
+                streamStarted = true;
                 notifyConnected(token, info);
                 receiver.run();
             } catch (IOException | RuntimeException e) {
                 if (isCurrent(token)) {
-                    Log.w(TAG, "connection ended: " + actionableMessage(e), e);
-                    notifyError(token, actionableMessage(e));
+                    reconnectReason = actionableMessage(e);
+                    stats.reconnect(reconnectReason);
+                    Log.w(TAG, "connection ended: " + reconnectReason, e);
+                    notifyError(token, reconnectReason);
                 }
             } finally {
                 if (receiver != null) {
-                    latestStats = receiver.getStats();
                     receiver.close();
                 }
                 activeReceiver = null;
@@ -147,6 +145,10 @@ final class ConnectionManager {
 
             if (!isCurrent(token)) {
                 return;
+            }
+            if (reconnectReason == null) {
+                reconnectReason = "stream ended";
+                stats.reconnect(reconnectReason);
             }
             notifyDisconnected(token);
             if (!sleepBeforeReconnect(token)) {
