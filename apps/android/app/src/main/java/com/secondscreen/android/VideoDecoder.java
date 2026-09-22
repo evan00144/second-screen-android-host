@@ -3,6 +3,8 @@ package com.secondscreen.android;
 import android.media.MediaCodec;
 import android.media.MediaFormat;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import android.view.Surface;
 
 import java.io.IOException;
@@ -62,6 +64,9 @@ final class VideoDecoder {
             }
             codec.configure(format, surface, null, 0);
             codec.start();
+            codec.setOnFrameRenderedListener(
+                    (renderedCodec, presentationTimeUs, nanoTime) -> stats.frameRendered(),
+                    new Handler(Looper.getMainLooper()));
         } catch (Exception e) {
             release();
             throw new IOException("Unable to start H.264 MediaCodec: " + e.getMessage(), e);

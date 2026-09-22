@@ -938,6 +938,8 @@ public:
 
     Result WaitForFrame(SOCKET socket, CapturedFrame& output) {
         output = {};
+        const std::uint64_t waitStartedUs = NowMicros();
+        std::uint64_t nextWaitLogUs = waitStartedUs + 5'000'000;
         while (!g_stop.load()) {
             if (!IsSocketConnected(socket)) {
                 return Result::Disconnected;
@@ -962,6 +964,12 @@ public:
             if (waitResult != WAIT_OBJECT_0 && waitResult != WAIT_TIMEOUT) {
                 SetError("WaitForSingleObject(FrameReady) returned an unexpected result");
                 return Result::Stopped;
+            }
+            const std::uint64_t nowUs = NowMicros();
+            if (nowUs >= nextWaitLogUs) {
+                std::cerr << "[CAPTURE] no FrameRing frame for "
+                          << ((nowUs - waitStartedUs) / 1'000'000) << " seconds; client still connected\n";
+                nextWaitLogUs = nowUs + 5'000'000;
             }
         }
         return Result::Stopped;

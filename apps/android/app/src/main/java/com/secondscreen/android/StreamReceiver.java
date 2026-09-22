@@ -146,6 +146,12 @@ final class StreamReceiver {
                     failStream("Video decoder stopped processing for 5 seconds");
                     return;
                 }
+                if (snapshot.decodedFrames > 1
+                        && (snapshot.lastSurfaceRenderNanos == 0
+                        || now - snapshot.lastSurfaceRenderNanos > STALL_TIMEOUT_NANOS)) {
+                    failStream("Video surface stopped rendering for 5 seconds");
+                    return;
+                }
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
