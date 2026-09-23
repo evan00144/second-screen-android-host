@@ -33,7 +33,8 @@ struct Direct3DDevice
 class SwapChainProcessor
 {
 public:
-    SwapChainProcessor(IDDCX_SWAPCHAIN swapChain,
+    SwapChainProcessor(IDDCX_MONITOR monitor,
+                       IDDCX_SWAPCHAIN swapChain,
                        std::shared_ptr<Direct3DDevice> device,
                        HANDLE newFrameEvent);
     ~SwapChainProcessor();
@@ -44,22 +45,37 @@ private:
     static DWORD WINAPI RunThread(_In_ LPVOID argument);
     void Run();
     void RunCore();
+    bool SetupHardwareCursor() noexcept;
+    void QueryHardwareCursor() noexcept;
     bool EnsureFrameRing();
     void CloseFrameRing() noexcept;
-    bool EnsureStagingTexture(UINT width, UINT height);
-    bool CaptureAndPublish(IDXGIResource* surface, UINT64 presentDisplayQpcTime);
+    bool EnsureStagingTextures(UINT width, UINT height);
+    bool MapAndPublishStagingFrame(
+        UINT stagingIndex,
+        UINT width,
+        UINT height,
+        UINT64 presentDisplayQpcTime,
+        std::uint64_t copyDurationUs);
+    bool CaptureAndPublish(
+        ComPtr<IDXGIResource>& surface,
+        UINT64 presentDisplayQpcTime);
 
+    IDDCX_MONITOR m_Monitor{};
     IDDCX_SWAPCHAIN m_SwapChain{};
     std::shared_ptr<Direct3DDevice> m_Device;
     HANDLE m_NewFrameEvent{};
+    HANDLE m_NewCursorEvent{};
     HANDLE m_Thread{};
     HANDLE m_TerminateEvent{};
     HANDLE m_FrameMapping{};
     HANDLE m_FrameReadyEvent{};
     UsbMonitorFrameRing::FrameRing* m_FrameRing{};
-    ComPtr<ID3D11Texture2D> m_StagingTexture;
+    ComPtr<ID3D11Texture2D> m_StagingTextures[2];
     UINT m_StagingWidth{};
     UINT m_StagingHeight{};
+    UINT m_StagingWriteIndex{};
+    std::unique_ptr<std::uint8_t[]> m_CursorShapeBuffer;
+    DWORD m_LastCursorShapeId{};
     std::uint64_t m_NextFrameId{1};
     std::uint64_t m_NextSequence{1};
     HRESULT m_StartStatus{S_OK};

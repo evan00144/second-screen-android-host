@@ -31,6 +31,7 @@ final class ConnectionManager {
     interface Listener {
         void onConnecting();
         void onConnected(ConnectionInfo info);
+        void onCursor(CursorState state);
         void onError(String message);
         void onDisconnected();
     }
@@ -127,7 +128,13 @@ final class ConnectionManager {
                     closeQuietly(socket);
                     return;
                 }
-                receiver = new StreamReceiver(socket, input, surface, info, stats);
+                receiver = new StreamReceiver(
+                        socket,
+                        input,
+                        surface,
+                        info,
+                        stats,
+                        state -> notifyCursor(token, state));
                 if (!installActiveReceiver(token, socket, receiver)) {
                     receiver.close();
                     return;
@@ -291,6 +298,12 @@ final class ConnectionManager {
     private void notifyConnected(long token, ConnectionInfo info) {
         if (isCurrent(token)) {
             listener.onConnected(info);
+        }
+    }
+
+    private void notifyCursor(long token, CursorState state) {
+        if (isCurrent(token)) {
+            listener.onCursor(state);
         }
     }
 

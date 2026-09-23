@@ -78,6 +78,7 @@ Restart the PnP device only when the driver itself must be reset; it is no longe
 ## Current Reliability Rules
 
 - Host sends heartbeat packets while the captured image is unchanged.
+- Host sends cursor position sideband packets; Android renders a low-latency cursor overlay.
 - Android does not treat a static desktop as a dead connection.
 - Encoded-frame dropping preserves IDR frames.
 - NVENC emits IDR plus SPS/PPS every quarter second.
@@ -85,4 +86,4 @@ Restart the PnP device only when the driver itself must be reset; it is no longe
 
 ## Next Work
 
-Do not change the stable video pipeline without measurements. The next milestone is interaction-latency telemetry, followed by targeted optimization described in `docs/implementation-plan.md`.
+Do not change the stable video pipeline without measurements. Cursor sideband is separate from H.264; tablet-to-Windows input remains out of scope. See `docs/implementation-plan.md` for the current phase.

@@ -1,6 +1,8 @@
 #include "Driver.h"
+#include "Avx2Convert.h"
 
 #include <emmintrin.h>
+#include <intrin.h>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -14,6 +16,10 @@ namespace
 {
 using UsbMonitorFrameRing::FrameRing;
 using UsbMonitorFrameRing::FrameSlot;
+
+constexpr UINT kCursorShapeWidth = 256;
+constexpr UINT kCursorShapeHeight = 256;
+constexpr UINT kCursorShapeBytes = kCursorShapeWidth * kCursorShapeHeight * 4;
 
 LONG ReadInterlockedState(volatile std::int32_t* state) noexcept
 {
@@ -39,6 +45,22 @@ bool ValidateFrameRing(FrameRing* ring) noexcept
 std::uint8_t ClampByte(int value) noexcept
 {
     return static_cast<std::uint8_t>(value < 0 ? 0 : value > 255 ? 255 : value);
+}
+
+bool HasAvx2() noexcept
+{
+    static const bool available = []() noexcept
+    {
+        int info[4]{};
+        __cpuidex(info, 0, 0);
+        if (info[0] < 7)
+        {
+            return false;
+        }
+        __cpuidex(info, 7, 0);
+        return (info[1] & (1 << 5)) != 0;
+    }();
+    return available;
 }
 
 std::uint64_t QpcToMicroseconds(UINT64 qpc) noexcept
@@ -480,15 +502,19 @@ HRESULT Direct3DDevice::Initialize()
 }
 
 SwapChainProcessor::SwapChainProcessor(
+    IDDCX_MONITOR monitor,
     IDDCX_SWAPCHAIN swapChain,
     std::shared_ptr<Direct3DDevice> device,
     HANDLE newFrameEvent)
-    : m_SwapChain(swapChain),
+    : m_Monitor(monitor),
+      m_SwapChain(swapChain),
       m_Device(std::move(device)),
       m_NewFrameEvent(newFrameEvent),
-      m_TerminateEvent(CreateEventW(nullptr, FALSE, FALSE, nullptr))
+      m_NewCursorEvent(CreateEventW(nullptr, FALSE, FALSE, nullptr)),
+      m_TerminateEvent(CreateEventW(nullptr, FALSE, FALSE, nullptr)),
+      m_CursorShapeBuffer(new (std::nothrow) std::uint8_t[kCursorShapeBytes])
 {
-    if (m_TerminateEvent == nullptr)
+    if (m_NewCursorEvent == nullptr || m_TerminateEvent == nullptr || m_CursorShapeBuffer == nullptr)
     {
         m_StartStatus = HRESULT_FROM_WIN32(GetLastError());
         return;
@@ -560,6 +586,38 @@ bool SwapChainProcessor::EnsureFrameRing()
     return true;
 }
 
+bool SwapChainProcessor::SetupHardwareCursor() noexcept
+{
+    IDARG_IN_SETUP_HWCURSOR args{};
+    args.CursorInfo.Size = sizeof(args.CursorInfo);
+    args.CursorInfo.ColorXorCursorSupport = IDDCX_XOR_CURSOR_SUPPORT_NONE;
+    args.CursorInfo.AlphaCursorSupport = TRUE;
+    args.CursorInfo.MaxX = kCursorShapeWidth;
+    args.CursorInfo.MaxY = kCursorShapeHeight;
+    args.hNewCursorDataAvailable = m_NewCursorEvent;
+    return NT_SUCCESS(IddCxMonitorSetupHardwareCursor(m_Monitor, &args));
+}
+
+void SwapChainProcessor::QueryHardwareCursor() noexcept
+{
+    if (m_CursorShapeBuffer == nullptr)
+    {
+        return;
+    }
+
+    IDARG_IN_QUERY_HWCURSOR args{};
+    args.LastShapeId = m_LastCursorShapeId;
+    args.ShapeBufferSizeInBytes = kCursorShapeBytes;
+    args.pShapeBuffer = m_CursorShapeBuffer.get();
+
+    IDARG_OUT_QUERY_HWCURSOR result{};
+    if (NT_SUCCESS(IddCxMonitorQueryHardwareCursor(m_Monitor, &args, &result)) &&
+        result.IsCursorShapeUpdated)
+    {
+        m_LastCursorShapeId = result.CursorShapeInfo.ShapeId;
+    }
+}
+
 void SwapChainProcessor::CloseFrameRing() noexcept
 {
     if (m_FrameRing != nullptr)
@@ -579,16 +637,22 @@ void SwapChainProcessor::CloseFrameRing() noexcept
     }
 }
 
-bool SwapChainProcessor::EnsureStagingTexture(UINT width, UINT height)
+bool SwapChainProcessor::EnsureStagingTextures(UINT width, UINT height)
 {
-    if (m_StagingTexture != nullptr &&
+    if (m_StagingTextures[0] != nullptr &&
+        m_StagingTextures[1] != nullptr &&
         m_StagingWidth == width &&
         m_StagingHeight == height)
     {
         return true;
     }
 
-    m_StagingTexture.Reset();
+    m_StagingTextures[0].Reset();
+    m_StagingTextures[1].Reset();
+    m_StagingWidth = 0;
+    m_StagingHeight = 0;
+    m_StagingWriteIndex = 0;
+
     D3D11_TEXTURE2D_DESC stagingDesc{};
     stagingDesc.Width = width;
     stagingDesc.Height = height;
@@ -599,60 +663,41 @@ bool SwapChainProcessor::EnsureStagingTexture(UINT width, UINT height)
     stagingDesc.Usage = D3D11_USAGE_STAGING;
     stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
 
-    if (FAILED(m_Device->Device->CreateTexture2D(&stagingDesc, nullptr, &m_StagingTexture)))
+    for (auto& stagingTexture : m_StagingTextures)
     {
-        m_StagingWidth = 0;
-        m_StagingHeight = 0;
-        return false;
+        if (FAILED(m_Device->Device->CreateTexture2D(
+                &stagingDesc,
+                nullptr,
+                &stagingTexture)))
+        {
+            m_StagingTextures[0].Reset();
+            m_StagingTextures[1].Reset();
+            return false;
+        }
     }
     m_StagingWidth = width;
     m_StagingHeight = height;
     return true;
 }
 
-bool SwapChainProcessor::CaptureAndPublish(
-    IDXGIResource* surface,
-    UINT64 presentDisplayQpcTime)
+bool SwapChainProcessor::MapAndPublishStagingFrame(
+    UINT stagingIndex,
+    UINT width,
+    UINT height,
+    UINT64 presentDisplayQpcTime,
+    std::uint64_t copyDurationUs)
 {
-    if (surface == nullptr || !EnsureFrameRing())
+    if (stagingIndex >= ARRAYSIZE(m_StagingTextures) ||
+        m_StagingTextures[stagingIndex] == nullptr)
     {
         return false;
     }
 
-    ComPtr<ID3D11Texture2D> sourceTexture;
-    if (FAILED(surface->QueryInterface(IID_PPV_ARGS(&sourceTexture))))
-    {
-        return false;
-    }
-
-    D3D11_TEXTURE2D_DESC sourceDesc{};
-    sourceTexture->GetDesc(&sourceDesc);
-    if (sourceDesc.Format != DXGI_FORMAT_B8G8R8A8_UNORM ||
-        sourceDesc.Width == 0 ||
-        sourceDesc.Height == 0 ||
-        sourceDesc.Width > UsbMonitorFrameRing::kMaxWidth ||
-        sourceDesc.Height > UsbMonitorFrameRing::kMaxHeight ||
-        (sourceDesc.Width & 1u) != 0 ||
-        (sourceDesc.Height & 1u) != 0 ||
-        sourceDesc.ArraySize != 1 ||
-        sourceDesc.MipLevels != 1 ||
-        sourceDesc.SampleDesc.Count != 1)
-    {
-        return false;
-    }
-
-    if (!EnsureStagingTexture(sourceDesc.Width, sourceDesc.Height))
-    {
-        return false;
-    }
-    const UINT64 copyStartQpc = QueryQpc();
-    m_Device->DeviceContext->CopyResource(m_StagingTexture.Get(), sourceTexture.Get());
-    const UINT64 copyEndQpc = QueryQpc();
-
+    ID3D11Texture2D* stagingTexture = m_StagingTextures[stagingIndex].Get();
     D3D11_MAPPED_SUBRESOURCE mapped{};
     const UINT64 mapStartQpc = QueryQpc();
     const HRESULT mapResult = m_Device->DeviceContext->Map(
-        m_StagingTexture.Get(),
+        stagingTexture,
         0,
         D3D11_MAP_READ,
         0,
@@ -666,12 +711,10 @@ bool SwapChainProcessor::CaptureAndPublish(
     FrameSlot* slot = ClaimFrameSlot(m_FrameRing);
     if (slot == nullptr)
     {
-        m_Device->DeviceContext->Unmap(m_StagingTexture.Get(), 0);
+        m_Device->DeviceContext->Unmap(stagingTexture, 0);
         return false;
     }
 
-    const std::uint32_t width = sourceDesc.Width;
-    const std::uint32_t height = sourceDesc.Height;
     const std::uint64_t captureTimestampUs = QpcToMicroseconds(presentDisplayQpcTime);
     std::uint64_t timestampUs = captureTimestampUs;
     if (timestampUs == 0)
@@ -683,12 +726,13 @@ bool SwapChainProcessor::CaptureAndPublish(
     }
     if (timestampUs == 0)
     {
-        m_Device->DeviceContext->Unmap(m_StagingTexture.Get(), 0);
+        m_Device->DeviceContext->Unmap(stagingTexture, 0);
         InterlockedExchange(
             reinterpret_cast<volatile LONG*>(&slot->state),
             UsbMonitorFrameRing::kSlotFree);
         return false;
     }
+
     slot->sequence = m_NextSequence++;
     slot->frameId = m_NextFrameId++;
     slot->captureTimestampUs = timestampUs;
@@ -698,13 +742,22 @@ bool SwapChainProcessor::CaptureAndPublish(
     slot->payloadLength = static_cast<std::uint32_t>(
         static_cast<std::size_t>(width) * height * 3 / 2);
     const UINT64 convertStartQpc = QueryQpc();
-    ConvertBgraToNv12(mapped, width, height, slot);
+    const bool convertedWithAvx2 = HasAvx2() && ConvertBgraToNv12Avx2(
+        static_cast<const std::uint8_t*>(mapped.pData),
+        mapped.RowPitch,
+        width,
+        height,
+        slot->payload);
+    if (!convertedWithAvx2)
+    {
+        ConvertBgraToNv12(mapped, width, height, slot);
+    }
     const UINT64 convertEndQpc = QueryQpc();
-    m_Device->DeviceContext->Unmap(m_StagingTexture.Get(), 0);
+    m_Device->DeviceContext->Unmap(stagingTexture, 0);
 
     InterlockedExchangeAdd64(
         reinterpret_cast<volatile LONG64*>(&m_FrameRing->telemetry.copyTotalUs),
-        static_cast<LONG64>(QpcDeltaToMicroseconds(copyStartQpc, copyEndQpc)));
+        static_cast<LONG64>(copyDurationUs));
     InterlockedExchangeAdd64(
         reinterpret_cast<volatile LONG64*>(&m_FrameRing->telemetry.mapTotalUs),
         static_cast<LONG64>(QpcDeltaToMicroseconds(mapStartQpc, mapEndQpc)));
@@ -725,6 +778,81 @@ bool SwapChainProcessor::CaptureAndPublish(
     return true;
 }
 
+bool SwapChainProcessor::CaptureAndPublish(
+    ComPtr<IDXGIResource>& surface,
+    UINT64 presentDisplayQpcTime)
+{
+    bool frameFinished = false;
+    const auto finishFrame = [&]() -> bool
+    {
+        if (frameFinished)
+        {
+            return true;
+        }
+        frameFinished = true;
+        return SUCCEEDED(IddCxSwapChainFinishedProcessingFrame(m_SwapChain));
+    };
+    const auto fail = [&]() -> bool
+    {
+        finishFrame();
+        return false;
+    };
+
+    if (surface == nullptr || !EnsureFrameRing())
+    {
+        return fail();
+    }
+
+    ComPtr<ID3D11Texture2D> sourceTexture;
+    if (FAILED(surface->QueryInterface(IID_PPV_ARGS(&sourceTexture))))
+    {
+        return fail();
+    }
+
+    D3D11_TEXTURE2D_DESC sourceDesc{};
+    sourceTexture->GetDesc(&sourceDesc);
+    if (sourceDesc.Format != DXGI_FORMAT_B8G8R8A8_UNORM ||
+        sourceDesc.Width == 0 ||
+        sourceDesc.Height == 0 ||
+        sourceDesc.Width > UsbMonitorFrameRing::kMaxWidth ||
+        sourceDesc.Height > UsbMonitorFrameRing::kMaxHeight ||
+        (sourceDesc.Width & 1u) != 0 ||
+        (sourceDesc.Height & 1u) != 0 ||
+        sourceDesc.ArraySize != 1 ||
+        sourceDesc.MipLevels != 1 ||
+        sourceDesc.SampleDesc.Count != 1)
+    {
+        return fail();
+    }
+
+    if (!EnsureStagingTextures(sourceDesc.Width, sourceDesc.Height))
+    {
+        return fail();
+    }
+
+    const UINT writeIndex = m_StagingWriteIndex;
+    const UINT64 copyStartQpc = QueryQpc();
+    m_Device->DeviceContext->CopyResource(
+        m_StagingTextures[writeIndex].Get(),
+        sourceTexture.Get());
+    const UINT64 copyEndQpc = QueryQpc();
+    const std::uint64_t copyDurationUs = QpcDeltaToMicroseconds(copyStartQpc, copyEndQpc);
+    sourceTexture.Reset();
+    surface.Reset();
+    if (!finishFrame())
+    {
+        return false;
+    }
+
+    m_StagingWriteIndex = (writeIndex + 1) % ARRAYSIZE(m_StagingTextures);
+    return MapAndPublishStagingFrame(
+        writeIndex,
+        sourceDesc.Width,
+        sourceDesc.Height,
+        presentDisplayQpcTime,
+        copyDurationUs);
+}
+
 SwapChainProcessor::~SwapChainProcessor()
 {
     if (m_Thread != nullptr)
@@ -737,6 +865,10 @@ SwapChainProcessor::~SwapChainProcessor()
     if (m_TerminateEvent != nullptr)
     {
         CloseHandle(m_TerminateEvent);
+    }
+    if (m_NewCursorEvent != nullptr)
+    {
+        CloseHandle(m_NewCursorEvent);
     }
     if (m_SwapChain != nullptr)
     {
@@ -782,16 +914,26 @@ void SwapChainProcessor::RunCore()
         return;
     }
 
+    if (SetupHardwareCursor())
+    {
+        QueryHardwareCursor();
+    }
+
     for (;;)
     {
         IDARG_OUT_RELEASEANDACQUIREBUFFER buffer{};
         HRESULT status = IddCxSwapChainReleaseAndAcquireBuffer(m_SwapChain, &buffer);
         if (status == E_PENDING)
         {
-            HANDLE waitHandles[] = { m_NewFrameEvent, m_TerminateEvent };
+            HANDLE waitHandles[] = { m_NewFrameEvent, m_NewCursorEvent, m_TerminateEvent };
             DWORD waitResult = WaitForMultipleObjects(ARRAYSIZE(waitHandles), waitHandles, FALSE, 16);
             if (waitResult == WAIT_OBJECT_0 || waitResult == WAIT_TIMEOUT)
             {
+                continue;
+            }
+            if (waitResult == WAIT_OBJECT_0 + 1)
+            {
+                QueryHardwareCursor();
                 continue;
             }
             break;
@@ -803,12 +945,8 @@ void SwapChainProcessor::RunCore()
 
         ComPtr<IDXGIResource> acquiredSurface;
         acquiredSurface.Attach(buffer.MetaData.pSurface);
-        CaptureAndPublish(acquiredSurface.Get(), buffer.MetaData.PresentDisplayQPCTime);
+        CaptureAndPublish(acquiredSurface, buffer.MetaData.PresentDisplayQPCTime);
         acquiredSurface.Reset();
-        if (FAILED(IddCxSwapChainFinishedProcessingFrame(m_SwapChain)))
-        {
-            break;
-        }
     }
     CloseFrameRing();
 }
@@ -931,7 +1069,11 @@ NTSTATUS IndirectMonitorContext::AssignSwapChain(
     }
 
     auto processor = std::unique_ptr<SwapChainProcessor>(
-        new (std::nothrow) SwapChainProcessor(swapChain, std::move(device), newFrameEvent));
+        new (std::nothrow) SwapChainProcessor(
+            m_Monitor,
+            swapChain,
+            std::move(device),
+            newFrameEvent));
     if (!processor)
     {
         WdfObjectDelete(static_cast<WDFOBJECT>(swapChain));

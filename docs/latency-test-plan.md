@@ -58,6 +58,9 @@ Host `[STATS]` fields:
 
 - `capture_fps`, `video_fps`: capture and packet production rate
 - `encode_call_avg_ms`, `encode_call_max_ms`: encode call including its send call
+- `nvenc_lock_input_*`, `nvenc_copy_*`, `nvenc_encode_*`, `nvenc_lock_output_*`: NVENC stage timing
+- `nvenc_output_wait_*`, `nvenc_pipeline_depth_max`, `nvenc_poll_busy_delta`: async completion-event pipeline behavior
+- `cursor`, `cursor_delta`: host cursor sideband packets sent
 - `send_avg_ms`, `send_max_ms`: socket write duration
 - `skipped_delta`, `send_fail`, `send_timeout`: host-side loss indicators
 - `queue_drop`, `queue_drop_delta`: stale frames replaced before encode
@@ -69,8 +72,9 @@ Phase 3 uses a bounded latest-frame queue. Capture continues while the worker
 encodes and sends; stale pending frames are replaced instead of building an
 unbounded backlog.
 
-Phase 5 uses SSE2 for the driver BGRA-to-NV12 conversion. Keep the driver
-stage telemetry enabled while comparing conversion time and frame rate.
+Phase 6.3 uses AVX2 for the driver BGRA-to-NV12 conversion when supported,
+with SSE2 fallback. Keep driver stage telemetry enabled while comparing
+conversion time and frame rate.
 
 Android `[STATS]` fields:
 
@@ -78,5 +82,6 @@ Android `[STATS]` fields:
 - `queue_avg_ms`, `queue_max_ms`: packet receive to `MediaCodec` submission delay
 - `drop_delta`: queue drops during the five-second window
 - `input_starvation`, `reconnect`: decoder and transport failures
+- `cursor_delta`: Android cursor control updates received during the log window
 
 Do not subtract host and Android monotonic timestamps. Use the camera result for end-to-end latency.

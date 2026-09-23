@@ -11,6 +11,7 @@ final class StreamStats {
     private final AtomicLong framesSubmitted = new AtomicLong();
     private final AtomicLong decoderInputStarvation = new AtomicLong();
     private final AtomicLong heartbeatPackets = new AtomicLong();
+    private final AtomicLong cursorUpdates = new AtomicLong();
     private final AtomicLong receivedBytes = new AtomicLong();
     private final AtomicLong queueDelaySamples = new AtomicLong();
     private final AtomicLong queueDelayNanosTotal = new AtomicLong();
@@ -24,6 +25,11 @@ final class StreamStats {
     private volatile int width;
     private volatile int height;
     private volatile String lastReconnectReason = "none";
+    private long lastSnapshotNanos;
+    private long lastSnapshotDecoded;
+    private long lastSnapshotBytes;
+    private double windowFps;
+    private double windowBitrate;
 
     void beginStream(int width, int height) {
         this.width = width;
@@ -35,6 +41,7 @@ final class StreamStats {
         framesSubmitted.set(0);
         decoderInputStarvation.set(0);
         heartbeatPackets.set(0);
+        cursorUpdates.set(0);
         receivedBytes.set(0);
         queueDelaySamples.set(0);
         queueDelayNanosTotal.set(0);
@@ -44,6 +51,11 @@ final class StreamStats {
         lastFrameReceivedNanos = 0;
         lastDecoderActivityNanos = 0;
         startedNanos = System.nanoTime();
+        lastSnapshotNanos = startedNanos;
+        lastSnapshotDecoded = 0;
+        lastSnapshotBytes = 0;
+        windowFps = 0.0;
+        windowBitrate = 0.0;
     }
 
     void packetReceived(int bytes, long captureTimestampUs, boolean randomAccess) {
@@ -61,6 +73,10 @@ final class StreamStats {
     void heartbeatReceived() {
         heartbeatPackets.incrementAndGet();
         lastPacketReceivedNanos = System.nanoTime();
+    }
+
+    void cursorUpdateReceived() {
+        cursorUpdates.incrementAndGet();
     }
 
     void frameDecoded() {
@@ -96,12 +112,21 @@ final class StreamStats {
         lastReconnectReason = normalized.isEmpty() ? "unknown" : normalized;
     }
 
-    Snapshot snapshot() {
+    synchronized Snapshot snapshot() {
         long nowNanos = System.nanoTime();
         long elapsedNanos = Math.max(1L, nowNanos - startedNanos);
         double seconds = elapsedNanos / 1_000_000_000.0;
-        double fps = decodedFrames.get() / seconds;
-        double bitrate = receivedBytes.get() * 8.0 / seconds;
+        long decoded = decodedFrames.get();
+        long bytes = receivedBytes.get();
+        double fps = decoded / seconds;
+        double bitrate = bytes * 8.0 / seconds;
+        long snapshotElapsedNanos = Math.max(1L, nowNanos - lastSnapshotNanos);
+        double snapshotSeconds = snapshotElapsedNanos / 1_000_000_000.0;
+        windowFps = (decoded - lastSnapshotDecoded) / snapshotSeconds;
+        windowBitrate = (bytes - lastSnapshotBytes) * 8.0 / snapshotSeconds;
+        lastSnapshotNanos = nowNanos;
+        lastSnapshotDecoded = decoded;
+        lastSnapshotBytes = bytes;
 
         long latencyMs = -1L;
         return new Snapshot(
@@ -109,6 +134,8 @@ final class StreamStats {
                 height,
                 fps,
                 bitrate,
+                windowFps,
+                windowBitrate,
                 latencyMs,
                 videoPacketsReceived.get(),
                 idrPacketsReceived.get(),
@@ -117,6 +144,7 @@ final class StreamStats {
                 framesSubmitted.get(),
                 decoderInputStarvation.get(),
                 heartbeatPackets.get(),
+                cursorUpdates.get(),
                 reconnectCount.get(),
                 lastReconnectReason,
                 queueDelaySamples.get(),
@@ -132,6 +160,8 @@ final class StreamStats {
         final int height;
         final double fps;
         final double bitrate;
+        final double windowFps;
+        final double windowBitrate;
         final long latencyMs;
         final long videoPacketsReceived;
         final long idrPacketsReceived;
@@ -140,6 +170,7 @@ final class StreamStats {
         final long framesSubmitted;
         final long decoderInputStarvation;
         final long heartbeatPackets;
+        final long cursorUpdates;
         final long reconnectCount;
         final String lastReconnectReason;
         final long queueDelaySamples;
@@ -154,6 +185,8 @@ final class StreamStats {
                 int height,
                 double fps,
                 double bitrate,
+                double windowFps,
+                double windowBitrate,
                 long latencyMs,
                 long videoPacketsReceived,
                 long idrPacketsReceived,
@@ -162,6 +195,7 @@ final class StreamStats {
                 long framesSubmitted,
                 long decoderInputStarvation,
                 long heartbeatPackets,
+                long cursorUpdates,
                 long reconnectCount,
                 String lastReconnectReason,
                 long queueDelaySamples,
@@ -174,6 +208,8 @@ final class StreamStats {
             this.height = height;
             this.fps = fps;
             this.bitrate = bitrate;
+            this.windowFps = windowFps;
+            this.windowBitrate = windowBitrate;
             this.latencyMs = latencyMs;
             this.videoPacketsReceived = videoPacketsReceived;
             this.idrPacketsReceived = idrPacketsReceived;
@@ -182,6 +218,7 @@ final class StreamStats {
             this.framesSubmitted = framesSubmitted;
             this.decoderInputStarvation = decoderInputStarvation;
             this.heartbeatPackets = heartbeatPackets;
+            this.cursorUpdates = cursorUpdates;
             this.reconnectCount = reconnectCount;
             this.lastReconnectReason = lastReconnectReason;
             this.queueDelaySamples = queueDelaySamples;
@@ -200,6 +237,7 @@ final class StreamStats {
             long decodedDelta = decodedFrames - previous.decodedFrames;
             long droppedDelta = droppedFrames - previous.droppedFrames;
             long heartbeatDelta = heartbeatPackets - previous.heartbeatPackets;
+            long cursorDelta = cursorUpdates - previous.cursorUpdates;
             long queueSamplesDelta = queueDelaySamples - previous.queueDelaySamples;
             long queueNanosDelta = queueDelayNanosTotal - previous.queueDelayNanosTotal;
             double queueAverageMs = queueSamplesDelta <= 0
@@ -210,7 +248,7 @@ final class StreamStats {
                             + "decoded=%d heartbeat=%d reconnect=%d last_reconnect=\"%s\" "
                             + "fps=%.1f bitrate=%.1fMbps window_s=%.1f recv_fps=%.1f "
                             + "submit_fps=%.1f decode_fps=%.1f drop_delta=%d heartbeat_delta=%d "
-                            + "queue_avg_ms=%.1f queue_max_ms=%.1f",
+                            + "cursor_delta=%d queue_avg_ms=%.1f queue_max_ms=%.1f",
                     videoPacketsReceived,
                     idrPacketsReceived,
                     droppedFrames,
@@ -228,6 +266,7 @@ final class StreamStats {
                     decodedDelta / elapsedSeconds,
                     droppedDelta,
                     heartbeatDelta,
+                    cursorDelta,
                     queueAverageMs,
                     queueDelayNanosMax / 1_000_000.0);
         }

@@ -91,6 +91,10 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="Driver.cpp" />
+    <ClCompile Include="Avx2Convert.cpp">
+      <AdditionalOptions>/arch:AVX2 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <ClInclude Include="Avx2Convert.h" />
     <ClInclude Include="Driver.h" />
     <Inf Include="UsbMonitorIddCx.inf" />
     <FilesToPackage Include="$(TargetPath)" />

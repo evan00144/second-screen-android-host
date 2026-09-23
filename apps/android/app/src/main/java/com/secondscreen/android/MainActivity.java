@@ -36,6 +36,7 @@ public final class MainActivity extends Activity implements ConnectionManager.Li
 
     private ConnectionManager connectionManager;
     private SurfaceView surfaceView;
+    private CursorOverlayView cursorOverlayView;
     private TextView statusView;
     private TextView statsView;
     private Button retryButton;
@@ -80,6 +81,11 @@ public final class MainActivity extends Activity implements ConnectionManager.Li
             }
         });
         root.addView(surfaceView, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT));
+
+        cursorOverlayView = new CursorOverlayView(this);
+        root.addView(cursorOverlayView, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT));
 
@@ -171,9 +177,9 @@ public final class MainActivity extends Activity implements ConnectionManager.Li
         String latency = snapshot.latencyMs < 0 ? "--" : Long.toString(snapshot.latencyMs);
         statsView.setText(String.format(Locale.US,
                 "%.0f FPS\n%s ms\n%.1f Mbps\n%d×%d\ndrop %d",
-                snapshot.fps,
+                snapshot.windowFps,
                 latency,
-                snapshot.bitrate / 1_000_000.0,
+                snapshot.windowBitrate / 1_000_000.0,
                 snapshot.width,
                 snapshot.height,
                 snapshot.droppedFrames));
@@ -191,9 +197,15 @@ public final class MainActivity extends Activity implements ConnectionManager.Li
     @Override
     public void onConnected(ConnectionInfo info) {
         runOnUiThread(() -> {
+            cursorOverlayView.setStreamSize(info.width, info.height);
             statusView.setVisibility(View.GONE);
             retryButton.setVisibility(View.GONE);
         });
+    }
+
+    @Override
+    public void onCursor(CursorState state) {
+        runOnUiThread(() -> cursorOverlayView.updateCursor(state));
     }
 
     @Override
@@ -208,6 +220,7 @@ public final class MainActivity extends Activity implements ConnectionManager.Li
     @Override
     public void onDisconnected() {
         runOnUiThread(() -> {
+            cursorOverlayView.clearCursor();
             statusView.setText("Host disconnected; retrying…");
             statusView.setVisibility(View.VISIBLE);
             retryButton.setVisibility(View.VISIBLE);

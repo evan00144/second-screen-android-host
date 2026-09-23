@@ -81,6 +81,77 @@ Start only after latency and packaging are stable:
 
 These remain separate from the current mouse/keyboard visual-latency milestone.
 
+## Phase 6: Capture Pipeline Overlap
+
+Status: implementation complete; runtime validation pending.
+
+- Use two D3D11 staging textures so GPU copy for the next frame overlaps CPU map and BGRA-to-NV12 conversion for the previous frame.
+- Publish the first frame synchronously so a static display never starts black.
+- Keep the existing FrameRing format and telemetry unchanged.
+
+Exit condition: 30-second run at 1920x1200 and 60 FPS reaches at least 55 FPS without increasing queue drops, send timeouts, or reconnects.
+
+## Phase 6.1: Early Swap-Chain Release
+
+Status: implementation complete; runtime validation pending.
+
+- Call IddCxSwapChainFinishedProcessingFrame immediately after CopyResource queues the GPU readback.
+- Keep CPU Map and BGRA-to-NV12 conversion outside the swap-chain hold time.
+
+Exit condition: capture cadence reaches at least 55 FPS at 1920x1200 and 60 Hz without regressions.
+
+## Phase 6.2: Release Acquired Surface Early
+
+Status: implementation complete; runtime validation pending.
+
+- Release the acquired IDXGIResource immediately after CopyResource completes.
+- Keep staging Map and CPU conversion outside both the acquired-surface lifetime and swap-chain hold time.
+
+Exit condition: capture cadence improves beyond the 42–50 FPS baseline without regressions.
+
+## Phase 6.3: AVX2 BGRA-to-NV12 Conversion
+
+Status: implementation complete; runtime validation pending.
+
+- Compile the hot conversion loop with `/arch:AVX2` in a separate translation unit.
+- Dispatch at runtime through CPUID, retaining the existing SSE2 converter as fallback.
+- Vectorize eight-pixel luma and four-sample 2x2 chroma batches; preserve the existing NV12 layout and FrameRing telemetry.
+
+Exit condition: conversion time drops materially from the 4 ms baseline on AVX2 hardware without changing frame bytes or increasing queue drops.
+
+## Phase 6.4: NVENC Stage Telemetry
+
+Status: implementation complete; runtime validation pending.
+
+- Split synchronous NVENC timing into input lock, NV12 copy, encode submission, and output lock.
+- Keep existing aggregate encode and socket-send metrics for comparison.
+- Use the stage breakdown to choose async NVENC or buffer-pool work without guessing.
+
+Exit condition: one five-second host summary identifies the dominant encode-stage stall.
+
+## Phase 6.5: Pipelined NVENC Output
+
+Status: implementation complete; runtime validation pending.
+
+- Use three reusable NVENC input and bitstream slots.
+- Use NVENC asynchronous completion events per slot; do not lock an output before its event fires.
+- Poll the oldest output in order; block only when all slots are occupied.
+- Preserve frame metadata, IDR cadence, packet ordering, and software fallback.
+
+Exit condition: 30-second 1920x1200 run reaches at least 55 video FPS with output wait materially below the 12 ms baseline, no send timeouts, and no sustained queue drops.
+
+## Phase 7: Cursor Sideband
+
+Status: implementation complete; runtime validation pending.
+
+- Poll the Windows cursor on the host at low latency and coalesce unchanged positions.
+- Send cursor visibility and coordinates as small SSV1 control packets outside the H.264 queue.
+- Render a lightweight cursor overlay above the Android `SurfaceView`.
+- Report cursor packet/update deltas and expose current-window FPS/bitrate in the Android overlay.
+- Keep tablet-to-Windows input injection out of scope.
+
+Exit condition: cursor movement remains responsive while video keeps its existing frame/drop/reconnect behavior.
+
 ## Commit Sequence
 
 1. `Add stream telemetry summaries`

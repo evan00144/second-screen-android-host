@@ -17,6 +17,9 @@ final class StreamReceiver {
     private static final String TAG = "SecondScreenStream";
     private static final int HEADER_BYTES = 24;
     private static final int MAGIC = 0x31565353;
+    private static final int CONTROL_LENGTH_FLAG = 0x80000000;
+    private static final int CURSOR_CONTROL_TYPE = 1;
+    private static final int CURSOR_PAYLOAD_BYTES = 32;
     private static final int MAX_ACCESS_UNIT_BYTES = 16 * 1024 * 1024;
     private static final long WATCHDOG_INTERVAL_MS = 1_000L;
     private static final long STALL_TIMEOUT_NANOS = 5_000_000_000L;
@@ -28,6 +31,7 @@ final class StreamReceiver {
     private final ConnectionInfo connectionInfo;
     private final LatestFrameQueue queue = new LatestFrameQueue();
     private final StreamStats stats;
+    private final CursorListener cursorListener;
     private final AtomicReference<Throwable> decoderFailure = new AtomicReference<>();
     private volatile boolean closed;
     private volatile boolean stopRequested;
@@ -39,12 +43,14 @@ final class StreamReceiver {
             InputStream input,
             Surface surface,
             ConnectionInfo connectionInfo,
-            StreamStats stats) {
+            StreamStats stats,
+            CursorListener cursorListener) {
         this.socket = socket;
         this.input = input;
         this.surface = surface;
         this.connectionInfo = connectionInfo;
         this.stats = stats;
+        this.cursorListener = cursorListener;
         stats.beginStream(connectionInfo.width, connectionInfo.height);
     }
 
@@ -73,6 +79,10 @@ final class StreamReceiver {
                 EncodedFrame frame = readPacket(input);
                 if (frame.heartbeat) {
                     stats.heartbeatReceived();
+                    continue;
+                }
+                if (frame.control) {
+                    dispatchControl(frame);
                     continue;
                 }
                 stats.packetReceived(
@@ -212,6 +222,31 @@ final class StreamReceiver {
         }
     }
 
+    private void dispatchControl(EncodedFrame frame) throws IOException {
+        if (frame.controlType != CURSOR_CONTROL_TYPE) {
+            return;
+        }
+        if (frame.controlPayload.length != CURSOR_PAYLOAD_BYTES) {
+            throw new ProtocolException("Invalid cursor control payload length: "
+                    + frame.controlPayload.length);
+        }
+        ByteBuffer payload = ByteBuffer.wrap(frame.controlPayload).order(ByteOrder.LITTLE_ENDIAN);
+        int version = payload.getInt();
+        boolean visible = payload.getInt() != 0;
+        int x = payload.getInt();
+        int y = payload.getInt();
+        int width = payload.getInt();
+        int height = payload.getInt();
+        long sequence = payload.getLong();
+        if (version != 1 || width <= 0 || height <= 0 || width > 16_384 || height > 16_384) {
+            throw new ProtocolException("Invalid cursor control state");
+        }
+        stats.cursorUpdateReceived();
+        if (cursorListener != null) {
+            cursorListener.onCursor(new CursorState(visible, x, y, width, height, sequence));
+        }
+    }
+
     private static EncodedFrame readPacket(InputStream input) throws IOException {
         byte[] header = new byte[HEADER_BYTES];
         readFully(input, header, 0, header.length);
@@ -221,7 +256,9 @@ final class StreamReceiver {
             throw new ProtocolException(String.format(
                     "Invalid SSV1 packet magic 0x%08x (expected 0x%08x)", magic, MAGIC));
         }
-        long unsignedLength = Integer.toUnsignedLong(buffer.getInt());
+        int rawLength = buffer.getInt();
+        boolean control = (rawLength & CONTROL_LENGTH_FLAG) != 0;
+        long unsignedLength = Integer.toUnsignedLong(rawLength & ~CONTROL_LENGTH_FLAG);
         if (unsignedLength > MAX_ACCESS_UNIT_BYTES) {
             throw new ProtocolException("Invalid SSV1 access-unit length: " + unsignedLength
                     + " (maximum " + MAX_ACCESS_UNIT_BYTES + ")");
@@ -238,26 +275,61 @@ final class StreamReceiver {
                     System.nanoTime(),
                     false,
                     true,
+                    false,
+                    0,
+                    new byte[0],
                     new byte[0]);
         }
-        byte[] accessUnit = new byte[(int) unsignedLength];
-        readFully(input, accessUnit, 0, accessUnit.length);
+        byte[] payload = new byte[(int) unsignedLength];
+        readFully(input, payload, 0, payload.length);
+        if (control) {
+            if (payload.length < 4) {
+                throw new ProtocolException("Control packet is missing its type");
+            }
+            ByteBuffer controlBuffer = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN);
+            int controlType = controlBuffer.getInt();
+            byte[] controlPayload = new byte[payload.length - 4];
+            System.arraycopy(payload, 4, controlPayload, 0, controlPayload.length);
+            return new EncodedFrame(
+                    frameId,
+                    captureTimestampUs,
+                    System.nanoTime(),
+                    false,
+                    false,
+                    true,
+                    controlType,
+                    controlPayload,
+                    new byte[0]);
+        }
         return new EncodedFrame(
                 frameId,
                 captureTimestampUs,
                 System.nanoTime(),
-                VideoDecoder.findNalUnit(accessUnit, 5) != null,
+                VideoDecoder.findNalUnit(payload, 5) != null,
                 false,
-                accessUnit);
+                false,
+                0,
+                new byte[0],
+                payload);
     }
 
-    private static EncodedFrame readVideoPacket(InputStream input) throws IOException {
+    private EncodedFrame readVideoPacket(InputStream input) throws IOException {
         while (true) {
             EncodedFrame frame = readPacket(input);
-            if (!frame.heartbeat) {
-                return frame;
+            if (frame.heartbeat) {
+                stats.heartbeatReceived();
+                continue;
             }
+            if (frame.control) {
+                dispatchControl(frame);
+                continue;
+            }
+            return frame;
         }
+    }
+
+    interface CursorListener {
+        void onCursor(CursorState state);
     }
 
     private static void readFully(InputStream input, byte[] buffer, int offset, int length)

@@ -58,6 +58,10 @@ constexpr size_t kMaxHandshakeBytes = 64 * 1024;
 constexpr int kClientSendBufferBytes = 32 * 1024;
 constexpr int kClientSendTimeoutMs = 2000;
 constexpr uint32_t kPacketMagic = 0x31565353; // bytes: 53 53 56 31 ("SSV1")
+constexpr uint32_t kControlLengthFlag = 0x80000000u;
+constexpr uint32_t kCursorControlType = 1;
+constexpr uint32_t kCursorControlVersion = 1;
+constexpr size_t kCursorControlPayloadBytes = 32;
 constexpr uint32_t kNvencPicFlagForceIdr = 0x2;
 constexpr uint32_t kNvencPicFlagOutputSpsPps = 0x4;
 constexpr uint64_t kHeartbeatIntervalUs = 1'000'000;
@@ -627,13 +631,77 @@ public:
     explicit PacketWriter(SOCKET socket) : socket_(socket) {}
 
     bool SendAccessUnit(uint64_t frameId, uint64_t timestampUs, const uint8_t* payload, size_t payloadLength) {
+        std::lock_guard lock(mutex_);
+        return SendAccessUnitLocked(frameId, timestampUs, payload, payloadLength);
+    }
+
+    bool SendCursor(bool visible, int32_t x, int32_t y, uint32_t width, uint32_t height, uint64_t sequence) {
+        std::array<uint8_t, 4 + kCursorControlPayloadBytes> payload{};
+        WriteLe32(payload.data(), kCursorControlType);
+        WriteLe32(payload.data() + 4, kCursorControlVersion);
+        WriteLe32(payload.data() + 8, visible ? 1u : 0u);
+        WriteLe32(payload.data() + 12, static_cast<uint32_t>(x));
+        WriteLe32(payload.data() + 16, static_cast<uint32_t>(y));
+        WriteLe32(payload.data() + 20, width);
+        WriteLe32(payload.data() + 24, height);
+        WriteLe64(payload.data() + 28, sequence);
+        std::lock_guard lock(mutex_);
+        return SendControlLocked(payload.data(), payload.size());
+    }
+
+private:
+    bool SendAccessUnitLocked(uint64_t frameId, uint64_t timestampUs, const uint8_t* payload, size_t payloadLength) {
         if (payloadLength > std::numeric_limits<uint32_t>::max()) {
             error_ = "encoded access unit exceeds uint32 packet length";
             return false;
         }
+        const bool sent = SendPacketLocked(
+            static_cast<uint32_t>(payloadLength),
+            frameId,
+            timestampUs,
+            payload,
+            payloadLength);
+        if (!sent) {
+            return false;
+        }
+        if (frameId == 0 && payloadLength == 0) {
+            ++heartbeatPacketsSent_;
+        } else {
+            ++videoPacketsSent_;
+            videoBytesSent_ += payloadLength;
+            if (ContainsNalType(payload, payloadLength, 5)) {
+                ++idrPacketsSent_;
+            }
+        }
+        return true;
+    }
+
+    bool SendControlLocked(const uint8_t* payload, size_t payloadLength) {
+        if (payloadLength > (std::numeric_limits<uint32_t>::max)() - kControlLengthFlag) {
+            error_ = "control packet exceeds uint32 packet length";
+            return false;
+        }
+        if (!SendPacketLocked(
+                kControlLengthFlag | static_cast<uint32_t>(payloadLength),
+                0,
+                NowMicros(),
+                payload,
+                payloadLength)) {
+            return false;
+        }
+        ++cursorPacketsSent_;
+        return true;
+    }
+
+    bool SendPacketLocked(
+            uint32_t encodedLength,
+            uint64_t frameId,
+            uint64_t timestampUs,
+            const uint8_t* payload,
+            size_t payloadLength) {
         std::array<uint8_t, 24> header{};
         WriteLe32(header.data(), kPacketMagic);
-        WriteLe32(header.data() + 4, static_cast<uint32_t>(payloadLength));
+        WriteLe32(header.data() + 4, encodedLength);
         WriteLe64(header.data() + 8, frameId);
         WriteLe64(header.data() + 16, timestampUs);
         const std::uint64_t sendStartedUs = NowMicros();
@@ -649,18 +717,10 @@ public:
             }
             return false;
         }
-        if (frameId == 0 && payloadLength == 0) {
-            ++heartbeatPacketsSent_;
-        } else {
-            ++videoPacketsSent_;
-            videoBytesSent_ += payloadLength;
-            if (ContainsNalType(payload, payloadLength, 5)) {
-                ++idrPacketsSent_;
-            }
-        }
         return true;
     }
 
+public:
     bool SendHeartbeat() {
         return SendAccessUnit(0, 0, nullptr, 0);
     }
@@ -671,6 +731,7 @@ public:
         }
         std::vector<uint8_t> converted;
         if (!ConvertLengthPrefixed(payload, payloadLength, converted)) {
+            std::lock_guard lock(mutex_);
             error_ = "encoder returned an unrecognized H.264 access unit (" +
                 std::to_string(payloadLength) + " bytes, prefix";
             for (std::size_t index = 0; index < std::min<std::size_t>(payloadLength, 16); ++index) {
@@ -684,24 +745,27 @@ public:
         return SendAccessUnit(frameId, timestampUs, converted.data(), converted.size());
     }
 
-    const std::string& error() const { return error_; }
-    std::uint64_t videoPacketsSent() const { return videoPacketsSent_; }
-    std::uint64_t idrPacketsSent() const { return idrPacketsSent_; }
-    std::uint64_t videoBytesSent() const { return videoBytesSent_; }
-    std::uint64_t heartbeatPacketsSent() const { return heartbeatPacketsSent_; }
-    std::uint64_t sendFailures() const { return sendFailures_; }
-    std::uint64_t sendTimeouts() const { return sendTimeouts_; }
-    std::uint64_t sendTimeTotalUs() const { return sendTimeTotalUs_; }
-    std::uint64_t sendTimeMaxUs() const { return sendTimeMaxUs_; }
-    std::uint64_t sendTimeSamples() const { return sendTimeSamples_; }
+    std::string error() const { std::lock_guard lock(mutex_); return error_; }
+    std::uint64_t videoPacketsSent() const { std::lock_guard lock(mutex_); return videoPacketsSent_; }
+    std::uint64_t idrPacketsSent() const { std::lock_guard lock(mutex_); return idrPacketsSent_; }
+    std::uint64_t videoBytesSent() const { std::lock_guard lock(mutex_); return videoBytesSent_; }
+    std::uint64_t heartbeatPacketsSent() const { std::lock_guard lock(mutex_); return heartbeatPacketsSent_; }
+    std::uint64_t cursorPacketsSent() const { std::lock_guard lock(mutex_); return cursorPacketsSent_; }
+    std::uint64_t sendFailures() const { std::lock_guard lock(mutex_); return sendFailures_; }
+    std::uint64_t sendTimeouts() const { std::lock_guard lock(mutex_); return sendTimeouts_; }
+    std::uint64_t sendTimeTotalUs() const { std::lock_guard lock(mutex_); return sendTimeTotalUs_; }
+    std::uint64_t sendTimeMaxUs() const { std::lock_guard lock(mutex_); return sendTimeMaxUs_; }
+    std::uint64_t sendTimeSamples() const { std::lock_guard lock(mutex_); return sendTimeSamples_; }
 
 private:
+    mutable std::mutex mutex_;
     SOCKET socket_ = INVALID_SOCKET;
     std::string error_;
     std::uint64_t videoPacketsSent_ = 0;
     std::uint64_t idrPacketsSent_ = 0;
     std::uint64_t videoBytesSent_ = 0;
     std::uint64_t heartbeatPacketsSent_ = 0;
+    std::uint64_t cursorPacketsSent_ = 0;
     std::uint64_t sendFailures_ = 0;
     std::uint64_t sendTimeouts_ = 0;
     std::uint64_t sendTimeTotalUs_ = 0;
@@ -1412,8 +1476,10 @@ using NvencInputPtr = void*;
 using NvencOutputPtr = void*;
 
 constexpr NvencStatus kNvencSuccess = 0;
+constexpr NvencStatus kNvencLockBusy = 13;
 constexpr NvencStatus kNvencNeedMoreInput = 17;
 constexpr NvencStatus kNvencEncoderBusy = 18;
+constexpr std::size_t kNvencPipelineSlotCount = 3;
 constexpr std::uint32_t kNvencApiVersion = 13u;
 constexpr std::uint32_t NvencStructVersion(std::uint32_t version) {
     return kNvencApiVersion | (version << 16) | (7u << 28);
@@ -1554,6 +1620,14 @@ struct NvencInitializeParams {
     void* reserved2[64];
 };
 
+struct NvencEventParams {
+    std::uint32_t version;
+    std::uint32_t reserved;
+    void* completionEvent;
+    std::uint32_t reserved1[253];
+    void* reserved2[64];
+};
+
 struct NvencCreateInputBuffer {
     std::uint32_t version;
     std::uint32_t width;
@@ -1659,6 +1733,8 @@ using NvencLockBitstreamFn = NvencStatus(__stdcall*)(void*, NvencLockBitstream*)
 using NvencUnlockBitstreamFn = NvencStatus(__stdcall*)(void*, NvencOutputPtr);
 using NvencLockInputFn = NvencStatus(__stdcall*)(void*, NvencLockInputBuffer*);
 using NvencUnlockInputFn = NvencStatus(__stdcall*)(void*, NvencInputPtr);
+using NvencRegisterAsyncEventFn = NvencStatus(__stdcall*)(void*, NvencEventParams*);
+using NvencUnregisterAsyncEventFn = NvencStatus(__stdcall*)(void*, NvencEventParams*);
 using NvencDestroyEncoderFn = NvencStatus(__stdcall*)(void*);
 
 struct NvencFunctionList {
@@ -1711,6 +1787,7 @@ std::string NvencStatusText(NvencStatus status) {
     case 9: return "invalid call";
     case 10: return "out of memory";
     case 11: return "encoder not initialized";
+    case kNvencLockBusy: return "lock busy";
     case 12: return "unsupported parameter";
     case 15: return "invalid version";
     case 17: return "need more input";
@@ -1722,9 +1799,34 @@ std::string NvencStatusText(NvencStatus status) {
 
 void CheckNvenc(NvencStatus status, const char* operation) {
     if (status != kNvencSuccess) {
-        throw std::runtime_error(std::string(operation) + " failed (" + NvencStatusText(status) + ")");
+        char code[16]{};
+        std::snprintf(code, sizeof(code), "0x%08X", static_cast<unsigned>(status));
+        throw std::runtime_error(
+            std::string(operation) + " failed (" + code + ": " + NvencStatusText(status) + ")");
     }
 }
+
+struct NvencStageTiming {
+    std::uint64_t totalUs{};
+    std::uint64_t maxUs{};
+    std::uint64_t samples{};
+
+    void Add(std::uint64_t durationUs) noexcept {
+        totalUs += durationUs;
+        maxUs = std::max(maxUs, durationUs);
+        ++samples;
+    }
+};
+
+struct NvencTimingStats {
+    NvencStageTiming lockInput;
+    NvencStageTiming copy;
+    NvencStageTiming encode;
+    NvencStageTiming lockOutput;
+    NvencStageTiming outputWait;
+    std::uint64_t pollBusy{};
+    std::uint64_t pipelineDepthMax{};
+};
 
 class NvencH264Encoder final {
 public:
@@ -1732,6 +1834,10 @@ public:
 
     ~NvencH264Encoder() {
         Reset();
+    }
+
+    NvencTimingStats timingStats() const {
+        return timingStats_;
     }
 
     void Initialize() {
@@ -1759,8 +1865,9 @@ public:
         auto initializeEncoder = Function<NvencInitializeFn>(api_.nvEncInitializeEncoder);
         auto createInput = Function<NvencCreateInputFn>(api_.nvEncCreateInputBuffer);
         auto createBitstream = Function<NvencCreateBitstreamFn>(api_.nvEncCreateBitstreamBuffer);
+        auto registerAsyncEvent = Function<NvencRegisterAsyncEventFn>(api_.nvEncRegisterAsyncEvent);
         if (openSession == nullptr || getPresetConfig == nullptr || initializeEncoder == nullptr ||
-            createInput == nullptr || createBitstream == nullptr) {
+            createInput == nullptr || createBitstream == nullptr || registerAsyncEvent == nullptr) {
             throw std::runtime_error("NvEncodeAPI function list is incomplete");
         }
 
@@ -1802,6 +1909,7 @@ public:
         initializeParams.darHeight = config_.height;
         initializeParams.frameRateNum = config_.fps;
         initializeParams.frameRateDen = 1;
+        initializeParams.enableEncodeAsync = 1;
         initializeParams.enablePtd = 1;
         initializeParams.maxEncodeWidth = config_.width;
         initializeParams.maxEncodeHeight = config_.height;
@@ -1809,36 +1917,59 @@ public:
         initializeParams.encodeConfig = &encodeConfig;
         CheckNvenc(initializeEncoder(session_, &initializeParams), "NvEncInitializeEncoder");
 
-        NvencCreateInputBuffer inputParams{};
-        inputParams.version = NvencStructVersion(2);
-        inputParams.width = config_.width;
-        inputParams.height = config_.height;
-        inputParams.bufferFmt = 1;
-        CheckNvenc(createInput(session_, &inputParams), "NvEncCreateInputBuffer");
-        inputBuffer_ = inputParams.inputBuffer;
+        for (auto& slot : slots_) {
+            slot.completionEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (slot.completionEvent == nullptr) {
+                ThrowWin32(GetLastError(), "CreateEventW(NVENC completion)");
+            }
+            NvencEventParams eventParams{};
+            eventParams.version = NvencStructVersion(1);
+            eventParams.completionEvent = slot.completionEvent;
+            CheckNvenc(registerAsyncEvent(session_, &eventParams), "NvEncRegisterAsyncEvent");
+            slot.eventRegistered = true;
 
-        NvencCreateBitstreamBuffer bitstreamParams{};
-        bitstreamParams.version = NvencStructVersion(1);
-        CheckNvenc(createBitstream(session_, &bitstreamParams), "NvEncCreateBitstreamBuffer");
-        bitstreamBuffer_ = bitstreamParams.bitstreamBuffer;
-        std::cout << "[ENCODER] hardware: NVIDIA NVENC (sync)\n";
+            NvencCreateInputBuffer inputParams{};
+            inputParams.version = NvencStructVersion(2);
+            inputParams.width = config_.width;
+            inputParams.height = config_.height;
+            inputParams.bufferFmt = 1;
+            CheckNvenc(createInput(session_, &inputParams), "NvEncCreateInputBuffer");
+            slot.inputBuffer = inputParams.inputBuffer;
+
+            NvencCreateBitstreamBuffer bitstreamParams{};
+            bitstreamParams.version = NvencStructVersion(1);
+            CheckNvenc(createBitstream(session_, &bitstreamParams), "NvEncCreateBitstreamBuffer");
+            slot.bitstreamBuffer = bitstreamParams.bitstreamBuffer;
+        }
+        std::cout << "[ENCODER] hardware: NVIDIA NVENC (3-slot async pipeline)\n";
     }
 
     bool EncodeFrame(PacketWriter& writer, const CapturedFrame& frame, std::uint64_t frameIndex) {
         auto lockInput = Function<NvencLockInputFn>(api_.nvEncLockInputBuffer);
         auto unlockInput = Function<NvencUnlockInputFn>(api_.nvEncUnlockInputBuffer);
         auto encodePicture = Function<NvencEncodePictureFn>(api_.nvEncEncodePicture);
-        auto lockBitstream = Function<NvencLockBitstreamFn>(api_.nvEncLockBitstream);
-        auto unlockBitstream = Function<NvencUnlockBitstreamFn>(api_.nvEncUnlockBitstream);
+        while (pendingSlots_.size() >= kNvencPipelineSlotCount) {
+            const OutputPollResult result = WaitForOutput(writer);
+            if (result == OutputPollResult::Failed) {
+                return false;
+            }
+        }
+
+        const std::size_t slotIndex = nextSlot_;
+        PipelineSlot& slot = slots_[slotIndex];
         NvencLockInputBuffer inputLock{};
         inputLock.version = NvencStructVersion(1);
-        inputLock.inputBuffer = inputBuffer_;
-        CheckNvenc(lockInput(session_, &inputLock), "NvEncLockInputBuffer");
+        inputLock.inputBuffer = slot.inputBuffer;
+        const std::uint64_t lockInputStartedUs = NowMicros();
+        const NvencStatus lockInputStatus = lockInput(session_, &inputLock);
+        timingStats_.lockInput.Add(NowMicros() - lockInputStartedUs);
+        CheckNvenc(lockInputStatus, "NvEncLockInputBuffer");
         if (inputLock.bufferDataPtr == nullptr || inputLock.pitch < frame.width) {
-            unlockInput(session_, inputBuffer_);
+            unlockInput(session_, slot.inputBuffer);
             throw std::runtime_error("NvEncLockInputBuffer returned invalid pitch");
         }
         auto* destination = static_cast<std::uint8_t*>(inputLock.bufferDataPtr);
+        const std::uint64_t copyStartedUs = NowMicros();
         for (std::uint32_t row = 0; row < frame.height; ++row) {
             std::memcpy(destination + static_cast<std::size_t>(row) * inputLock.pitch,
                         frame.nv12 + static_cast<std::size_t>(row) * frame.stride,
@@ -1848,12 +1979,12 @@ public:
         auto* destinationUv = destination + static_cast<std::size_t>(inputLock.pitch) * frame.height;
         for (std::uint32_t row = 0; row < frame.height / 2; ++row) {
             std::memcpy(destinationUv + static_cast<std::size_t>(row) * inputLock.pitch,
-                        sourceUv + static_cast<std::size_t>(row) * frame.stride,
-                        frame.width);
+                         sourceUv + static_cast<std::size_t>(row) * frame.stride,
+                         frame.width);
         }
-        CheckNvenc(unlockInput(session_, inputBuffer_), "NvEncUnlockInputBuffer");
+        timingStats_.copy.Add(NowMicros() - copyStartedUs);
+        CheckNvenc(unlockInput(session_, slot.inputBuffer), "NvEncUnlockInputBuffer");
 
-        pendingFrames_.push_back({frame.frameId, frame.captureTimestampUs});
         NvencPicParams picture{};
         picture.version = NvencStructVersion(4) | (1u << 31);
         picture.inputWidth = frame.width;
@@ -1861,46 +1992,72 @@ public:
         picture.inputPitch = inputLock.pitch;
         picture.frameIdx = static_cast<std::uint32_t>(frameIndex);
         picture.inputTimeStamp = (frameIndex * 10'000'000ULL) / config_.fps;
-        picture.inputBuffer = inputBuffer_;
-        picture.outputBitstream = bitstreamBuffer_;
+        picture.inputBuffer = slot.inputBuffer;
+        picture.outputBitstream = slot.bitstreamBuffer;
+        picture.completionEvent = slot.completionEvent;
         picture.bufferFmt = 1;
         picture.pictureStruct = 1;
         const std::uint64_t keyframeInterval = std::max<std::uint64_t>(1, config_.fps / 4);
         picture.encodePicFlags = frameIndex % keyframeInterval == 0
             ? kNvencPicFlagForceIdr | kNvencPicFlagOutputSpsPps
             : 0;
-        const NvencStatus encodeStatus = encodePicture(session_, &picture);
+        NvencStatus encodeStatus = kNvencEncoderBusy;
+        while (encodeStatus == kNvencEncoderBusy) {
+            const std::uint64_t encodeStartedUs = NowMicros();
+            encodeStatus = encodePicture(session_, &picture);
+            timingStats_.encode.Add(NowMicros() - encodeStartedUs);
+            if (encodeStatus == kNvencEncoderBusy) {
+                const OutputPollResult result = PollOutput(writer, false);
+                if (result == OutputPollResult::Failed) {
+                    return false;
+                }
+                if (result == OutputPollResult::NotReady) {
+                    Sleep(1);
+                }
+            }
+        }
+        if (encodeStatus != kNvencSuccess && encodeStatus != kNvencNeedMoreInput) {
+            CheckNvenc(encodeStatus, "NvEncEncodePicture");
+        }
+
+        slot.metadata = {frame.frameId, frame.captureTimestampUs};
+        slot.submitted = true;
+        pendingSlots_.push_back(slotIndex);
+        timingStats_.pipelineDepthMax = std::max(
+            timingStats_.pipelineDepthMax,
+            static_cast<std::uint64_t>(pendingSlots_.size()));
+        nextSlot_ = (slotIndex + 1) % kNvencPipelineSlotCount;
+
         if (encodeStatus == kNvencNeedMoreInput) {
             return true;
         }
-        CheckNvenc(encodeStatus, "NvEncEncodePicture");
 
-        NvencLockBitstream outputLock{};
-        outputLock.version = NvencStructVersion(1);
-        outputLock.outputBitstream = bitstreamBuffer_;
-        CheckNvenc(lockBitstream(session_, &outputLock), "NvEncLockBitstream");
-        bool sent = false;
-        try {
-            const FrameMetadata metadata = pendingFrames_.empty()
-                ? FrameMetadata{frame.frameId, frame.captureTimestampUs}
-                : pendingFrames_.front();
-            if (!pendingFrames_.empty()) {
-                pendingFrames_.pop_front();
+        ++readyOutputs_;
+
+        for (;;) {
+            const OutputPollResult result = PollOutput(writer, false);
+            if (result == OutputPollResult::NotReady) {
+                break;
             }
-            sent = writer.SendAnnexB(
-                metadata.frameId,
-                metadata.timestampUs,
-                static_cast<const std::uint8_t*>(outputLock.bitstreamBufferPtr),
-                outputLock.bitstreamSizeInBytes);
-        } catch (...) {
-            unlockBitstream(session_, bitstreamBuffer_);
-            throw;
+            if (result == OutputPollResult::Failed) {
+                return false;
+            }
         }
-        CheckNvenc(unlockBitstream(session_, bitstreamBuffer_), "NvEncUnlockBitstream");
-        return sent;
+        return true;
     }
 
-    bool Drain(PacketWriter&) { return pendingFrames_.empty(); }
+    bool Drain(PacketWriter& writer) {
+        while (!pendingSlots_.empty()) {
+            const OutputPollResult result = PollOutput(writer, true);
+            if (result == OutputPollResult::Failed) {
+                return false;
+            }
+            if (result == OutputPollResult::NotReady) {
+                Sleep(1);
+            }
+        }
+        return true;
+    }
     void Flush() {}
 
 private:
@@ -1908,6 +2065,85 @@ private:
         std::uint64_t frameId;
         std::uint64_t timestampUs;
     };
+
+    struct PipelineSlot {
+        NvencInputPtr inputBuffer{};
+        NvencOutputPtr bitstreamBuffer{};
+        HANDLE completionEvent{};
+        bool eventRegistered{};
+        FrameMetadata metadata{};
+        bool submitted{};
+    };
+
+    enum class OutputPollResult {
+        NotReady,
+        Sent,
+        Failed,
+    };
+
+    OutputPollResult PollOutput(PacketWriter& writer, bool wait) {
+        if (pendingSlots_.empty() || readyOutputs_ == 0) {
+            return OutputPollResult::NotReady;
+        }
+
+        auto lockBitstream = Function<NvencLockBitstreamFn>(api_.nvEncLockBitstream);
+        auto unlockBitstream = Function<NvencUnlockBitstreamFn>(api_.nvEncUnlockBitstream);
+        const std::size_t slotIndex = pendingSlots_.front();
+        PipelineSlot& slot = slots_[slotIndex];
+        const std::uint64_t lockOutputStartedUs = NowMicros();
+        const DWORD waitResult = WaitForSingleObject(slot.completionEvent, wait ? INFINITE : 0);
+        if (waitResult == WAIT_TIMEOUT) {
+            ++timingStats_.pollBusy;
+            return OutputPollResult::NotReady;
+        }
+        if (waitResult != WAIT_OBJECT_0) {
+            ThrowWin32(GetLastError(), "WaitForSingleObject(NVENC completion)");
+        }
+        NvencLockBitstream outputLock{};
+        outputLock.version = NvencStructVersion(1);
+        outputLock.outputBitstream = slot.bitstreamBuffer;
+        const NvencStatus lockOutputStatus = lockBitstream(session_, &outputLock);
+        const std::uint64_t lockOutputDurationUs = NowMicros() - lockOutputStartedUs;
+        timingStats_.lockOutput.Add(lockOutputDurationUs);
+        if (wait) {
+            timingStats_.outputWait.Add(lockOutputDurationUs);
+        }
+        if (lockOutputStatus == kNvencLockBusy) {
+            ++timingStats_.pollBusy;
+            return OutputPollResult::NotReady;
+        }
+        CheckNvenc(lockOutputStatus, "NvEncLockBitstream");
+
+        bool sent = false;
+        try {
+            sent = writer.SendAnnexB(
+                slot.metadata.frameId,
+                slot.metadata.timestampUs,
+                static_cast<const std::uint8_t*>(outputLock.bitstreamBufferPtr),
+                outputLock.bitstreamSizeInBytes);
+        } catch (...) {
+            unlockBitstream(session_, slot.bitstreamBuffer);
+            throw;
+        }
+        CheckNvenc(
+            unlockBitstream(session_, slot.bitstreamBuffer),
+            "NvEncUnlockBitstream");
+        --readyOutputs_;
+        slot.submitted = false;
+        pendingSlots_.pop_front();
+        return sent ? OutputPollResult::Sent : OutputPollResult::Failed;
+    }
+
+    OutputPollResult WaitForOutput(PacketWriter& writer) {
+        while (!pendingSlots_.empty()) {
+            const OutputPollResult result = PollOutput(writer, true);
+            if (result != OutputPollResult::NotReady) {
+                return result;
+            }
+            Sleep(1);
+        }
+        return OutputPollResult::NotReady;
+    }
 
     template <typename FunctionType>
     static FunctionType Function(void* value) {
@@ -1968,18 +2204,33 @@ private:
     }
 
     void Reset() {
-        if (session_ != nullptr && inputBuffer_ != nullptr && api_.nvEncDestroyInputBuffer != nullptr) {
-            Function<NvencDestroyInputFn>(api_.nvEncDestroyInputBuffer)(session_, inputBuffer_);
+        auto unregisterAsyncEvent = Function<NvencUnregisterAsyncEventFn>(api_.nvEncUnregisterAsyncEvent);
+        for (auto& slot : slots_) {
+            if (slot.completionEvent != nullptr) {
+                if (session_ != nullptr && slot.eventRegistered && unregisterAsyncEvent != nullptr) {
+                    NvencEventParams eventParams{};
+                    eventParams.version = NvencStructVersion(1);
+                    eventParams.completionEvent = slot.completionEvent;
+                    unregisterAsyncEvent(session_, &eventParams);
+                }
+                CloseHandle(slot.completionEvent);
+                slot.completionEvent = nullptr;
+                slot.eventRegistered = false;
+            }
         }
-        if (session_ != nullptr && bitstreamBuffer_ != nullptr && api_.nvEncDestroyBitstreamBuffer != nullptr) {
-            Function<NvencDestroyBitstreamFn>(api_.nvEncDestroyBitstreamBuffer)(session_, bitstreamBuffer_);
+        for (auto& slot : slots_) {
+            if (session_ != nullptr && slot.inputBuffer != nullptr && api_.nvEncDestroyInputBuffer != nullptr) {
+                Function<NvencDestroyInputFn>(api_.nvEncDestroyInputBuffer)(session_, slot.inputBuffer);
+            }
+            if (session_ != nullptr && slot.bitstreamBuffer != nullptr && api_.nvEncDestroyBitstreamBuffer != nullptr) {
+                Function<NvencDestroyBitstreamFn>(api_.nvEncDestroyBitstreamBuffer)(session_, slot.bitstreamBuffer);
+            }
+            slot = {};
         }
         if (session_ != nullptr && api_.nvEncDestroyEncoder != nullptr) {
             Function<NvencDestroyEncoderFn>(api_.nvEncDestroyEncoder)(session_);
         }
         session_ = nullptr;
-        inputBuffer_ = nullptr;
-        bitstreamBuffer_ = nullptr;
         d3dContext_.Reset();
         d3dDevice_.Reset();
         if (module_ != nullptr) {
@@ -1987,23 +2238,31 @@ private:
             module_ = nullptr;
         }
         api_ = {};
-        pendingFrames_.clear();
+        pendingSlots_.clear();
+        nextSlot_ = 0;
+        readyOutputs_ = 0;
     }
 
     StreamConfig config_;
     HMODULE module_ = nullptr;
     NvencFunctionList api_{};
     void* session_ = nullptr;
-    NvencInputPtr inputBuffer_ = nullptr;
-    NvencOutputPtr bitstreamBuffer_ = nullptr;
     ComPtr<ID3D11Device> d3dDevice_;
     ComPtr<ID3D11DeviceContext> d3dContext_;
-    std::deque<FrameMetadata> pendingFrames_;
+    std::array<PipelineSlot, kNvencPipelineSlotCount> slots_{};
+    std::deque<std::size_t> pendingSlots_;
+    std::size_t nextSlot_{};
+    std::size_t readyOutputs_{};
+    NvencTimingStats timingStats_;
 };
 
 class H264Encoder {
 public:
     explicit H264Encoder(const StreamConfig& config) : config_(config) {}
+
+    NvencTimingStats nvencTimingStats() const {
+        return nvenc_ ? nvenc_->timingStats() : NvencTimingStats{};
+    }
 
     void Initialize() {
         ComPtr<IMFMediaType> outputType;
@@ -2701,6 +2960,124 @@ void ConfigureClientSocket(SOCKET socket) {
     }
 }
 
+struct CursorUpdate {
+    bool visible = false;
+    std::int32_t x = 0;
+    std::int32_t y = 0;
+    std::uint32_t width = 1;
+    std::uint32_t height = 1;
+    std::uint64_t sequence = 0;
+};
+
+class CursorTracker final {
+public:
+    CursorTracker(std::uint32_t width, std::uint32_t height)
+        : width_(width), height_(height) {}
+
+    bool Poll(CursorUpdate& output) {
+        const std::uint64_t nowUs = NowMicros();
+        if (nowUs >= nextMonitorRefreshUs_) {
+            RefreshTargetMonitor(nowUs);
+        }
+
+        CURSORINFO cursorInfo{};
+        cursorInfo.cbSize = sizeof(cursorInfo);
+        POINT cursorPosition{};
+        const bool cursorAvailable = GetCursorInfo(&cursorInfo) != FALSE &&
+            GetCursorPos(&cursorPosition) != FALSE;
+        const HMONITOR cursorMonitor = cursorAvailable
+            ? MonitorFromPoint(cursorPosition, MONITOR_DEFAULTTONULL)
+            : nullptr;
+        bool visible = cursorAvailable &&
+            (cursorInfo.flags & CURSOR_SHOWING) != 0 &&
+            targetMonitor_ != nullptr &&
+            cursorMonitor == targetMonitor_;
+        std::int32_t x = 0;
+        std::int32_t y = 0;
+        if (visible) {
+            x = static_cast<std::int32_t>(cursorPosition.x - targetRect.left);
+            y = static_cast<std::int32_t>(cursorPosition.y - targetRect.top);
+            x = std::clamp<std::int32_t>(x, 0, static_cast<std::int32_t>(width_ - 1));
+            y = std::clamp<std::int32_t>(y, 0, static_cast<std::int32_t>(height_ - 1));
+        }
+
+        if (!hasState_ || visible != lastVisible_ || x != lastX_ || y != lastY_) {
+            hasState_ = true;
+            lastVisible_ = visible;
+            lastX_ = x;
+            lastY_ = y;
+            output = {visible, x, y, width_, height_, ++sequence_};
+            return true;
+        }
+        return false;
+    }
+
+private:
+    struct MonitorSearch {
+        CursorTracker* tracker = nullptr;
+        HMONITOR namedMonitor = nullptr;
+        RECT namedRect{};
+        HMONITOR fallbackMonitor = nullptr;
+        RECT fallbackRect{};
+    };
+
+    static BOOL CALLBACK FindMonitor(HMONITOR monitor, HDC, LPRECT, LPARAM parameter) {
+        auto* search = reinterpret_cast<MonitorSearch*>(parameter);
+        MONITORINFOEXW monitorInfo{};
+        monitorInfo.cbSize = sizeof(monitorInfo);
+        if (GetMonitorInfoW(monitor, &monitorInfo) == FALSE) {
+            return TRUE;
+        }
+        DISPLAY_DEVICEW displayDevice{};
+        displayDevice.cb = sizeof(displayDevice);
+        const bool hasDisplayDevice = EnumDisplayDevicesW(
+            monitorInfo.szDevice,
+            0,
+            &displayDevice,
+            0) != FALSE;
+        const std::wstring deviceText = hasDisplayDevice
+            ? std::wstring(displayDevice.DeviceString)
+            : std::wstring();
+        const bool isTargetDevice = deviceText.find(L"USB Monitor Transport") != std::wstring::npos;
+        const LONG monitorWidth = monitorInfo.rcMonitor.right - monitorInfo.rcMonitor.left;
+        const LONG monitorHeight = monitorInfo.rcMonitor.bottom - monitorInfo.rcMonitor.top;
+        const bool hasExpectedSize = monitorWidth == static_cast<LONG>(search->tracker->width_) &&
+            monitorHeight == static_cast<LONG>(search->tracker->height_);
+        const bool isPrimary = hasDisplayDevice &&
+            (displayDevice.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) != 0;
+        if (isTargetDevice) {
+            search->namedMonitor = monitor;
+            search->namedRect = monitorInfo.rcMonitor;
+            return FALSE;
+        }
+        if (search->fallbackMonitor == nullptr && hasExpectedSize && !isPrimary) {
+            search->fallbackMonitor = monitor;
+            search->fallbackRect = monitorInfo.rcMonitor;
+        }
+        return TRUE;
+    }
+
+    void RefreshTargetMonitor(std::uint64_t nowUs) {
+        MonitorSearch search{};
+        search.tracker = this;
+        EnumDisplayMonitors(nullptr, nullptr, FindMonitor, reinterpret_cast<LPARAM>(&search));
+        targetMonitor_ = search.namedMonitor != nullptr ? search.namedMonitor : search.fallbackMonitor;
+        targetRect = search.namedMonitor != nullptr ? search.namedRect : search.fallbackRect;
+        nextMonitorRefreshUs_ = nowUs + 1'000'000;
+    }
+
+    std::uint32_t width_;
+    std::uint32_t height_;
+    HMONITOR targetMonitor_ = nullptr;
+    RECT targetRect{};
+    std::uint64_t nextMonitorRefreshUs_ = 0;
+    std::uint64_t sequence_ = 0;
+    bool hasState_ = false;
+    bool lastVisible_ = false;
+    std::int32_t lastX_ = 0;
+    std::int32_t lastY_ = 0;
+};
+
 BOOL WINAPI ConsoleControlHandler(DWORD controlType) {
     switch (controlType) {
     case CTRL_C_EVENT:
@@ -2907,6 +3284,27 @@ void StreamClient(
     }
     updateCaptureStats();
 
+    PacketWriter writer(socket);
+    std::atomic_bool stopCursor{false};
+    std::thread cursorThread([&] {
+        CursorTracker tracker(effectiveConfig.width, effectiveConfig.height);
+        while (!g_stop.load() && !stopCursor.load() && !state.stopCapture.load()) {
+            CursorUpdate update;
+            if (tracker.Poll(update) && !writer.SendCursor(
+                    update.visible,
+                    update.x,
+                    update.y,
+                    update.width,
+                    update.height,
+                    update.sequence)) {
+                state.stopCapture.store(true);
+                shutdown(socket, SD_BOTH);
+                break;
+            }
+            Sleep(4);
+        }
+    });
+
     std::thread worker([&] {
         HRESULT workerComResult = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         const bool workerComInitialized = SUCCEEDED(workerComResult);
@@ -2916,7 +3314,6 @@ void StreamClient(
             }
             H264Encoder encoder(effectiveConfig);
             encoder.Initialize();
-            PacketWriter writer(socket);
             std::uint64_t encodeCallTotalUs = 0;
             std::uint64_t encodeCallMaxUs = 0;
             std::uint64_t encodeCallSamples = 0;
@@ -2927,6 +3324,7 @@ void StreamClient(
             std::uint64_t previousVideo = 0;
             std::uint64_t previousBytes = 0;
             std::uint64_t previousHeartbeats = 0;
+            std::uint64_t previousCursorPackets = 0;
             std::uint64_t previousEncodeCallTotalUs = 0;
             std::uint64_t previousEncodeCallSamples = 0;
             std::uint64_t previousSendTimeTotalUs = 0;
@@ -2936,6 +3334,7 @@ void StreamClient(
             std::uint64_t previousDriverCopyUs = 0;
             std::uint64_t previousDriverMapUs = 0;
             std::uint64_t previousDriverConvertUs = 0;
+            NvencTimingStats previousNvencTiming{};
             const auto logStats = [&] {
                 const std::uint64_t nowUs = NowMicros();
                 if (nowUs < nextStatsLogUs) {
@@ -2960,10 +3359,46 @@ void StreamClient(
                 const std::uint64_t videoDelta = writer.videoPacketsSent() - previousVideo;
                 const std::uint64_t bytesDelta = writer.videoBytesSent() - previousBytes;
                 const std::uint64_t heartbeatDelta = writer.heartbeatPacketsSent() - previousHeartbeats;
+                const std::uint64_t cursorPackets = writer.cursorPacketsSent();
+                const std::uint64_t cursorDelta = cursorPackets - previousCursorPackets;
                 const std::uint64_t encodeSamplesDelta = encodeCallSamples - previousEncodeCallSamples;
                 const std::uint64_t sendSamplesDelta = writer.sendTimeSamples() - previousSendTimeSamples;
                 const std::uint64_t encodeTimeDelta = encodeCallTotalUs - previousEncodeCallTotalUs;
                 const std::uint64_t sendTimeDelta = writer.sendTimeTotalUs() - previousSendTimeTotalUs;
+                const NvencTimingStats nvencTiming = encoder.nvencTimingStats();
+                const std::uint64_t nvencLockInputTotalDelta = counterDelta(
+                    nvencTiming.lockInput.totalUs,
+                    previousNvencTiming.lockInput.totalUs);
+                const std::uint64_t nvencLockInputSamplesDelta = counterDelta(
+                    nvencTiming.lockInput.samples,
+                    previousNvencTiming.lockInput.samples);
+                const std::uint64_t nvencCopyTotalDelta = counterDelta(
+                    nvencTiming.copy.totalUs,
+                    previousNvencTiming.copy.totalUs);
+                const std::uint64_t nvencCopySamplesDelta = counterDelta(
+                    nvencTiming.copy.samples,
+                    previousNvencTiming.copy.samples);
+                const std::uint64_t nvencEncodeTotalDelta = counterDelta(
+                    nvencTiming.encode.totalUs,
+                    previousNvencTiming.encode.totalUs);
+                const std::uint64_t nvencEncodeSamplesDelta = counterDelta(
+                    nvencTiming.encode.samples,
+                    previousNvencTiming.encode.samples);
+                const std::uint64_t nvencLockOutputTotalDelta = counterDelta(
+                    nvencTiming.lockOutput.totalUs,
+                    previousNvencTiming.lockOutput.totalUs);
+                const std::uint64_t nvencLockOutputSamplesDelta = counterDelta(
+                    nvencTiming.lockOutput.samples,
+                    previousNvencTiming.lockOutput.samples);
+                const std::uint64_t nvencOutputWaitTotalDelta = counterDelta(
+                    nvencTiming.outputWait.totalUs,
+                    previousNvencTiming.outputWait.totalUs);
+                const std::uint64_t nvencOutputWaitSamplesDelta = counterDelta(
+                    nvencTiming.outputWait.samples,
+                    previousNvencTiming.outputWait.samples);
+                const std::uint64_t nvencPollBusyDelta = counterDelta(
+                    nvencTiming.pollBusy,
+                    previousNvencTiming.pollBusy);
                 const std::uint64_t queueDrops = queue.droppedFrames();
                 std::cout << "[STATS] capture=" << capture
                           << " skipped=" << skipped
@@ -2980,6 +3415,8 @@ void StreamClient(
                           << " skipped_delta=" << skippedDelta
                           << " bytes_mbps=" << bytesDelta * 8.0 / elapsedSeconds / 1'000'000.0
                           << " heartbeat_delta=" << heartbeatDelta
+                          << " cursor=" << cursorPackets
+                          << " cursor_delta=" << cursorDelta
                           << " queue_drop=" << queueDrops
                           << " queue_drop_delta=" << (queueDrops - previousQueueDrops)
                           << " queue_pending=" << (queue.pending() ? 1 : 0)
@@ -2992,6 +3429,33 @@ void StreamClient(
                           << " encode_call_avg_ms="
                           << (encodeSamplesDelta == 0 ? 0.0 : encodeTimeDelta / encodeSamplesDelta / 1'000.0)
                           << " encode_call_max_ms=" << encodeCallMaxUs / 1'000.0
+                          << " nvenc_lock_input_avg_ms="
+                          << (nvencLockInputSamplesDelta == 0
+                                  ? 0.0
+                                  : nvencLockInputTotalDelta / nvencLockInputSamplesDelta / 1'000.0)
+                          << " nvenc_lock_input_max_ms=" << nvencTiming.lockInput.maxUs / 1'000.0
+                          << " nvenc_copy_avg_ms="
+                          << (nvencCopySamplesDelta == 0
+                                  ? 0.0
+                                  : nvencCopyTotalDelta / nvencCopySamplesDelta / 1'000.0)
+                          << " nvenc_copy_max_ms=" << nvencTiming.copy.maxUs / 1'000.0
+                          << " nvenc_encode_avg_ms="
+                          << (nvencEncodeSamplesDelta == 0
+                                  ? 0.0
+                                  : nvencEncodeTotalDelta / nvencEncodeSamplesDelta / 1'000.0)
+                          << " nvenc_encode_max_ms=" << nvencTiming.encode.maxUs / 1'000.0
+                          << " nvenc_lock_output_avg_ms="
+                          << (nvencLockOutputSamplesDelta == 0
+                                  ? 0.0
+                                  : nvencLockOutputTotalDelta / nvencLockOutputSamplesDelta / 1'000.0)
+                          << " nvenc_lock_output_max_ms=" << nvencTiming.lockOutput.maxUs / 1'000.0
+                          << " nvenc_output_wait_avg_ms="
+                          << (nvencOutputWaitSamplesDelta == 0
+                                  ? 0.0
+                                  : nvencOutputWaitTotalDelta / nvencOutputWaitSamplesDelta / 1'000.0)
+                          << " nvenc_output_wait_max_ms=" << nvencTiming.outputWait.maxUs / 1'000.0
+                          << " nvenc_pipeline_depth_max=" << nvencTiming.pipelineDepthMax
+                          << " nvenc_poll_busy_delta=" << nvencPollBusyDelta
                           << " send_avg_ms="
                           << (sendSamplesDelta == 0 ? 0.0 : sendTimeDelta / sendSamplesDelta / 1'000.0)
                           << " send_max_ms=" << writer.sendTimeMaxUs() / 1'000.0 << '\n';
@@ -3001,6 +3465,7 @@ void StreamClient(
                 previousVideo = writer.videoPacketsSent();
                 previousBytes = writer.videoBytesSent();
                 previousHeartbeats = writer.heartbeatPacketsSent();
+                previousCursorPackets = cursorPackets;
                 previousEncodeCallTotalUs = encodeCallTotalUs;
                 previousEncodeCallSamples = encodeCallSamples;
                 previousSendTimeTotalUs = writer.sendTimeTotalUs();
@@ -3010,6 +3475,7 @@ void StreamClient(
                 previousDriverCopyUs = driverCopyUs;
                 previousDriverMapUs = driverMapUs;
                 previousDriverConvertUs = driverConvertUs;
+                previousNvencTiming = nvencTiming;
                 nextStatsLogUs = nowUs + 5'000'000;
             };
 
@@ -3091,6 +3557,10 @@ void StreamClient(
     }
     queue.Close();
     worker.join();
+    stopCursor.store(true);
+    if (cursorThread.joinable()) {
+        cursorThread.join();
+    }
     encodedFrames = state.encodedFrames.load();
 }
 } // namespace
