@@ -12,7 +12,7 @@ Run both `30 FPS` and `60 FPS` at the same resolution and bitrate.
 
 ## Start
 
-Stop any previous host process first. Use the Phase 2 host binary:
+Stop any previous host process first. Use the Phase 3 host binary:
 
 ```powershell
 adb reverse tcp:5000 tcp:5000
@@ -23,7 +23,7 @@ adb logcat -c
 Terminal 1:
 
 ```powershell
-.\build\host\phase2\second-screen-host.exe --width 1920 --height 1200 --fps 60 --bitrate 8000000 2>&1 | Tee-Object .\latency-host.log
+.\build\host\phase3\second-screen-host.exe --width 1920 --height 1200 --fps 60 --bitrate 8000000 2>&1 | Tee-Object .\latency-host.log
 ```
 
 Terminal 2:
@@ -60,6 +60,17 @@ Host `[STATS]` fields:
 - `encode_call_avg_ms`, `encode_call_max_ms`: encode call including its send call
 - `send_avg_ms`, `send_max_ms`: socket write duration
 - `skipped_delta`, `send_fail`, `send_timeout`: host-side loss indicators
+- `queue_drop`, `queue_drop_delta`: stale frames replaced before encode
+- `queue_pending`: latest-frame queue contains a pending frame
+- `driver_fps`: frames published by the display driver
+- `driver_copy_avg_ms`, `driver_map_avg_ms`, `driver_convert_avg_ms`: per-frame driver capture stages
+
+Phase 3 uses a bounded latest-frame queue. Capture continues while the worker
+encodes and sends; stale pending frames are replaced instead of building an
+unbounded backlog.
+
+Phase 5 uses SSE2 for the driver BGRA-to-NV12 conversion. Keep the driver
+stage telemetry enabled while comparing conversion time and frame rate.
 
 Android `[STATS]` fields:
 

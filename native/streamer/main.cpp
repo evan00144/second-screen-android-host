@@ -25,6 +25,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -32,6 +33,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -990,6 +992,13 @@ struct FrameRingStats {
     std::uint64_t framesSkipped = 0;
 };
 
+struct FrameRingDriverStats {
+    std::uint64_t framesPublished = 0;
+    std::uint64_t copyTotalUs = 0;
+    std::uint64_t mapTotalUs = 0;
+    std::uint64_t convertTotalUs = 0;
+};
+
 class FrameRingReader final {
 public:
     enum class Result {
@@ -1014,12 +1023,27 @@ public:
         return {framesRead_, framesSkipped_};
     }
 
-    Result WaitForFrame(SOCKET socket, CapturedFrame& output) {
+    FrameRingDriverStats driverStats() const {
+        const auto* ring = host_.ring();
+        if (!IsValidFrameRingHeader(ring)) {
+            return {};
+        }
+        return {
+            ring->telemetry.framesPublished,
+            ring->telemetry.copyTotalUs,
+            ring->telemetry.mapTotalUs,
+            ring->telemetry.convertTotalUs};
+    }
+
+    Result WaitForFrame(SOCKET socket, CapturedFrame& output, const std::atomic_bool* externalStop = nullptr) {
         output = {};
         const std::uint64_t waitStartedUs = NowMicros();
         std::uint64_t nextHeartbeatUs = waitStartedUs + kHeartbeatIntervalUs;
         std::uint64_t nextWaitLogUs = waitStartedUs + 5'000'000;
         while (!g_stop.load()) {
+            if (externalStop != nullptr && externalStop->load()) {
+                return Result::Stopped;
+            }
             if (!IsSocketConnected(socket)) {
                 return Result::Disconnected;
             }
@@ -1232,6 +1256,154 @@ private:
             return true;
         }
         return false;
+    }
+};
+
+struct OwnedFrame final {
+    std::vector<std::uint8_t> payload;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::uint32_t stride = 0;
+    std::uint64_t frameId = 0;
+    std::uint64_t captureTimestampUs = 0;
+
+    void Swap(OwnedFrame& other) noexcept {
+        payload.swap(other.payload);
+        std::swap(width, other.width);
+        std::swap(height, other.height);
+        std::swap(stride, other.stride);
+        std::swap(frameId, other.frameId);
+        std::swap(captureTimestampUs, other.captureTimestampUs);
+    }
+
+    CapturedFrame View() const {
+        return {
+            payload.data(),
+            payload.size(),
+            width,
+            height,
+            stride,
+            frameId,
+            captureTimestampUs};
+    }
+};
+
+class LatestFrameQueue final {
+public:
+    enum class Item {
+        Frame,
+        Heartbeat,
+        Closed,
+    };
+
+    bool Publish(const CapturedFrame& frame) {
+        std::lock_guard lock(mutex_);
+        if (closed_ || aborted_) {
+            return false;
+        }
+        pending_.payload.resize(frame.nv12Length);
+        std::memcpy(pending_.payload.data(), frame.nv12, frame.nv12Length);
+        pending_.width = frame.width;
+        pending_.height = frame.height;
+        pending_.stride = frame.stride;
+        pending_.frameId = frame.frameId;
+        pending_.captureTimestampUs = frame.captureTimestampUs;
+        if (hasPending_) {
+            droppedFrames_.fetch_add(1);
+        }
+        hasPending_ = true;
+        cv_.notify_one();
+        return true;
+    }
+
+    bool PublishHeartbeat() {
+        std::lock_guard lock(mutex_);
+        if (closed_ || aborted_) {
+            return false;
+        }
+        heartbeatPending_ = true;
+        cv_.notify_one();
+        return true;
+    }
+
+    Item Wait(OwnedFrame& output) {
+        std::unique_lock lock(mutex_);
+        cv_.wait(lock, [this] {
+            return hasPending_ || heartbeatPending_ || closed_ || aborted_;
+        });
+        if (hasPending_) {
+            output.Swap(pending_);
+            hasPending_ = false;
+            return Item::Frame;
+        }
+        if (heartbeatPending_) {
+            heartbeatPending_ = false;
+            return Item::Heartbeat;
+        }
+        return Item::Closed;
+    }
+
+    void Close() {
+        std::lock_guard lock(mutex_);
+        closed_ = true;
+        cv_.notify_all();
+    }
+
+    void Abort() {
+        std::lock_guard lock(mutex_);
+        aborted_ = true;
+        closed_ = true;
+        hasPending_ = false;
+        heartbeatPending_ = false;
+        cv_.notify_all();
+    }
+
+    bool aborted() const {
+        std::lock_guard lock(mutex_);
+        return aborted_;
+    }
+
+    bool pending() const {
+        std::lock_guard lock(mutex_);
+        return hasPending_;
+    }
+
+    std::uint64_t droppedFrames() const {
+        return droppedFrames_.load();
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+    OwnedFrame pending_;
+    bool hasPending_ = false;
+    bool heartbeatPending_ = false;
+    bool closed_ = false;
+    bool aborted_ = false;
+    std::atomic<std::uint64_t> droppedFrames_{0};
+};
+
+struct AsyncStreamState final {
+    std::atomic_bool stopCapture{false};
+    std::atomic_bool workerFailed{false};
+    std::atomic<std::uint64_t> captureFrames{0};
+    std::atomic<std::uint64_t> captureSkipped{0};
+    std::atomic<std::uint64_t> driverFrames{0};
+    std::atomic<std::uint64_t> driverCopyUs{0};
+    std::atomic<std::uint64_t> driverMapUs{0};
+    std::atomic<std::uint64_t> driverConvertUs{0};
+    std::atomic<std::uint64_t> encodedFrames{0};
+    mutable std::mutex errorMutex;
+    std::string workerError;
+
+    void SetWorkerError(std::string error) {
+        std::lock_guard lock(errorMutex);
+        workerError = std::move(error);
+    }
+
+    std::string GetWorkerError() const {
+        std::lock_guard lock(errorMutex);
+        return workerError;
     }
 };
 
@@ -2711,103 +2883,197 @@ void StreamClient(
         effectiveConfig.width = firstFrame.width;
         effectiveConfig.height = firstFrame.height;
     }
-    H264Encoder encoder(effectiveConfig);
-    encoder.Initialize();
-    PacketWriter writer(socket);
-    std::uint64_t encodeCallTotalUs = 0;
-    std::uint64_t encodeCallMaxUs = 0;
-    std::uint64_t encodeCallSamples = 0;
-    const auto encodeFrame = [&](const CapturedFrame& frame) {
-        const std::uint64_t startedUs = NowMicros();
-        const bool encoded = encoder.EncodeFrame(writer, frame);
-        const std::uint64_t durationUs = NowMicros() - startedUs;
-        encodeCallTotalUs += durationUs;
-        encodeCallMaxUs = std::max(encodeCallMaxUs, durationUs);
-        ++encodeCallSamples;
-        return encoded;
-    };
-    std::uint64_t nextStatsLogUs = NowMicros() + 5'000'000;
-    std::uint64_t previousStatsUs = nextStatsLogUs - 5'000'000;
-    std::uint64_t previousCapture = 0;
-    std::uint64_t previousSkipped = 0;
-    std::uint64_t previousVideo = 0;
-    std::uint64_t previousBytes = 0;
-    std::uint64_t previousHeartbeats = 0;
-    std::uint64_t previousEncodeCallTotalUs = 0;
-    std::uint64_t previousEncodeCallSamples = 0;
-    std::uint64_t previousSendTimeTotalUs = 0;
-    std::uint64_t previousSendTimeSamples = 0;
-    const auto logStats = [&]() {
-        const std::uint64_t nowUs = NowMicros();
-        if (nowUs < nextStatsLogUs) {
-            return;
-        }
-        const FrameRingStats ringStats = reader.stats();
-        const double elapsedSeconds = std::max<std::uint64_t>(1, nowUs - previousStatsUs) / 1'000'000.0;
-        const std::uint64_t captureDelta = ringStats.framesRead - previousCapture;
-        const std::uint64_t skippedDelta = ringStats.framesSkipped - previousSkipped;
-        const std::uint64_t videoDelta = writer.videoPacketsSent() - previousVideo;
-        const std::uint64_t bytesDelta = writer.videoBytesSent() - previousBytes;
-        const std::uint64_t heartbeatDelta = writer.heartbeatPacketsSent() - previousHeartbeats;
-        const std::uint64_t encodeSamplesDelta = encodeCallSamples - previousEncodeCallSamples;
-        const std::uint64_t sendSamplesDelta = writer.sendTimeSamples() - previousSendTimeSamples;
-        const std::uint64_t encodeTimeDelta = encodeCallTotalUs - previousEncodeCallTotalUs;
-        const std::uint64_t sendTimeDelta = writer.sendTimeTotalUs() - previousSendTimeTotalUs;
-        std::cout << "[STATS] capture=" << ringStats.framesRead
-                  << " skipped=" << ringStats.framesSkipped
-                  << " video=" << writer.videoPacketsSent()
-                  << " idr=" << writer.idrPacketsSent()
-                  << " bytes=" << writer.videoBytesSent()
-                  << " heartbeat=" << writer.heartbeatPacketsSent()
-                  << " send_fail=" << writer.sendFailures()
-                  << " send_timeout=" << writer.sendTimeouts()
-                  << " window_s=" << elapsedSeconds
-                  << " capture_fps=" << captureDelta / elapsedSeconds
-                  << " video_fps=" << videoDelta / elapsedSeconds
-                  << " skipped_delta=" << skippedDelta
-                  << " bytes_mbps=" << bytesDelta * 8.0 / elapsedSeconds / 1'000'000.0
-                  << " heartbeat_delta=" << heartbeatDelta
-                  << " encode_call_avg_ms="
-                  << (encodeSamplesDelta == 0 ? 0.0 : encodeTimeDelta / encodeSamplesDelta / 1'000.0)
-                  << " encode_call_max_ms=" << encodeCallMaxUs / 1'000.0
-                  << " send_avg_ms="
-                  << (sendSamplesDelta == 0 ? 0.0 : sendTimeDelta / sendSamplesDelta / 1'000.0)
-                  << " send_max_ms=" << writer.sendTimeMaxUs() / 1'000.0 << '\n';
-        previousStatsUs = nowUs;
-        previousCapture = ringStats.framesRead;
-        previousSkipped = ringStats.framesSkipped;
-        previousVideo = writer.videoPacketsSent();
-        previousBytes = writer.videoBytesSent();
-        previousHeartbeats = writer.heartbeatPacketsSent();
-        previousEncodeCallTotalUs = encodeCallTotalUs;
-        previousEncodeCallSamples = encodeCallSamples;
-        previousSendTimeTotalUs = writer.sendTimeTotalUs();
-        previousSendTimeSamples = writer.sendTimeSamples();
-        nextStatsLogUs = nowUs + 5'000'000;
-    };
     if (!SendHandshakeResponse(socket, effectiveConfig, handshakeError)) {
         std::cerr << "[CLIENT] handshake response failed: " << handshakeError << '\n';
         return;
     }
     std::cout << "[CLIENT] connected: " << request.device << " (requested " << request.width << 'x' << request.height
               << ", streaming " << effectiveConfig.width << 'x' << effectiveConfig.height << ")\n";
-    if (!g_stop.load() && (config.frames == 0 || encodedFrames < config.frames)) {
-        if (!encodeFrame(firstFrame)) {
-            std::cerr << "[CLIENT] stream stopped: " << writer.error() << '\n';
-            return;
-        }
-        ++encodedFrames;
-        logStats();
+
+    LatestFrameQueue queue;
+    AsyncStreamState state;
+    const auto updateCaptureStats = [&]() {
+        const FrameRingStats stats = reader.stats();
+        const FrameRingDriverStats driverStats = reader.driverStats();
+        state.captureFrames.store(stats.framesRead);
+        state.captureSkipped.store(stats.framesSkipped);
+        state.driverFrames.store(driverStats.framesPublished);
+        state.driverCopyUs.store(driverStats.copyTotalUs);
+        state.driverMapUs.store(driverStats.mapTotalUs);
+        state.driverConvertUs.store(driverStats.convertTotalUs);
+    };
+    if (!queue.Publish(firstFrame)) {
+        return;
     }
-    while (!g_stop.load() && (config.frames == 0 || encodedFrames < config.frames)) {
-        CapturedFrame frame;
-        const FrameRingReader::Result result = reader.WaitForFrame(socket, frame);
-        if (result == FrameRingReader::Result::Heartbeat) {
-            if (!writer.SendHeartbeat()) {
-                std::cerr << "[CLIENT] stream stopped: " << writer.error() << '\n';
-                return;
+    updateCaptureStats();
+
+    std::thread worker([&] {
+        HRESULT workerComResult = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        const bool workerComInitialized = SUCCEEDED(workerComResult);
+        try {
+            if (FAILED(workerComResult) && workerComResult != RPC_E_CHANGED_MODE) {
+                ThrowHr(workerComResult, "worker CoInitializeEx");
             }
-            logStats();
+            H264Encoder encoder(effectiveConfig);
+            encoder.Initialize();
+            PacketWriter writer(socket);
+            std::uint64_t encodeCallTotalUs = 0;
+            std::uint64_t encodeCallMaxUs = 0;
+            std::uint64_t encodeCallSamples = 0;
+            std::uint64_t nextStatsLogUs = NowMicros() + 5'000'000;
+            std::uint64_t previousStatsUs = nextStatsLogUs - 5'000'000;
+            std::uint64_t previousCapture = 0;
+            std::uint64_t previousSkipped = 0;
+            std::uint64_t previousVideo = 0;
+            std::uint64_t previousBytes = 0;
+            std::uint64_t previousHeartbeats = 0;
+            std::uint64_t previousEncodeCallTotalUs = 0;
+            std::uint64_t previousEncodeCallSamples = 0;
+            std::uint64_t previousSendTimeTotalUs = 0;
+            std::uint64_t previousSendTimeSamples = 0;
+            std::uint64_t previousQueueDrops = 0;
+            std::uint64_t previousDriverFrames = 0;
+            std::uint64_t previousDriverCopyUs = 0;
+            std::uint64_t previousDriverMapUs = 0;
+            std::uint64_t previousDriverConvertUs = 0;
+            const auto logStats = [&] {
+                const std::uint64_t nowUs = NowMicros();
+                if (nowUs < nextStatsLogUs) {
+                    return;
+                }
+                const auto counterDelta = [](std::uint64_t current, std::uint64_t previous) {
+                    return current >= previous ? current - previous : current;
+                };
+                const std::uint64_t capture = state.captureFrames.load();
+                const std::uint64_t skipped = state.captureSkipped.load();
+                const std::uint64_t driverFrames = state.driverFrames.load();
+                const std::uint64_t driverCopyUs = state.driverCopyUs.load();
+                const std::uint64_t driverMapUs = state.driverMapUs.load();
+                const std::uint64_t driverConvertUs = state.driverConvertUs.load();
+                const double elapsedSeconds = std::max<std::uint64_t>(1, nowUs - previousStatsUs) / 1'000'000.0;
+                const std::uint64_t captureDelta = capture - previousCapture;
+                const std::uint64_t skippedDelta = skipped - previousSkipped;
+                const std::uint64_t driverFrameDelta = counterDelta(driverFrames, previousDriverFrames);
+                const std::uint64_t driverCopyDeltaUs = counterDelta(driverCopyUs, previousDriverCopyUs);
+                const std::uint64_t driverMapDeltaUs = counterDelta(driverMapUs, previousDriverMapUs);
+                const std::uint64_t driverConvertDeltaUs = counterDelta(driverConvertUs, previousDriverConvertUs);
+                const std::uint64_t videoDelta = writer.videoPacketsSent() - previousVideo;
+                const std::uint64_t bytesDelta = writer.videoBytesSent() - previousBytes;
+                const std::uint64_t heartbeatDelta = writer.heartbeatPacketsSent() - previousHeartbeats;
+                const std::uint64_t encodeSamplesDelta = encodeCallSamples - previousEncodeCallSamples;
+                const std::uint64_t sendSamplesDelta = writer.sendTimeSamples() - previousSendTimeSamples;
+                const std::uint64_t encodeTimeDelta = encodeCallTotalUs - previousEncodeCallTotalUs;
+                const std::uint64_t sendTimeDelta = writer.sendTimeTotalUs() - previousSendTimeTotalUs;
+                const std::uint64_t queueDrops = queue.droppedFrames();
+                std::cout << "[STATS] capture=" << capture
+                          << " skipped=" << skipped
+                          << " video=" << writer.videoPacketsSent()
+                          << " idr=" << writer.idrPacketsSent()
+                          << " bytes=" << writer.videoBytesSent()
+                          << " heartbeat=" << writer.heartbeatPacketsSent()
+                          << " send_fail=" << writer.sendFailures()
+                          << " send_timeout=" << writer.sendTimeouts()
+                          << " window_s=" << elapsedSeconds
+                          << " capture_fps=" << captureDelta / elapsedSeconds
+                          << " driver_fps=" << driverFrameDelta / elapsedSeconds
+                          << " video_fps=" << videoDelta / elapsedSeconds
+                          << " skipped_delta=" << skippedDelta
+                          << " bytes_mbps=" << bytesDelta * 8.0 / elapsedSeconds / 1'000'000.0
+                          << " heartbeat_delta=" << heartbeatDelta
+                          << " queue_drop=" << queueDrops
+                          << " queue_drop_delta=" << (queueDrops - previousQueueDrops)
+                          << " queue_pending=" << (queue.pending() ? 1 : 0)
+                          << " driver_copy_avg_ms="
+                          << (driverFrameDelta == 0 ? 0.0 : driverCopyDeltaUs / driverFrameDelta / 1'000.0)
+                          << " driver_map_avg_ms="
+                          << (driverFrameDelta == 0 ? 0.0 : driverMapDeltaUs / driverFrameDelta / 1'000.0)
+                          << " driver_convert_avg_ms="
+                          << (driverFrameDelta == 0 ? 0.0 : driverConvertDeltaUs / driverFrameDelta / 1'000.0)
+                          << " encode_call_avg_ms="
+                          << (encodeSamplesDelta == 0 ? 0.0 : encodeTimeDelta / encodeSamplesDelta / 1'000.0)
+                          << " encode_call_max_ms=" << encodeCallMaxUs / 1'000.0
+                          << " send_avg_ms="
+                          << (sendSamplesDelta == 0 ? 0.0 : sendTimeDelta / sendSamplesDelta / 1'000.0)
+                          << " send_max_ms=" << writer.sendTimeMaxUs() / 1'000.0 << '\n';
+                previousStatsUs = nowUs;
+                previousCapture = capture;
+                previousSkipped = skipped;
+                previousVideo = writer.videoPacketsSent();
+                previousBytes = writer.videoBytesSent();
+                previousHeartbeats = writer.heartbeatPacketsSent();
+                previousEncodeCallTotalUs = encodeCallTotalUs;
+                previousEncodeCallSamples = encodeCallSamples;
+                previousSendTimeTotalUs = writer.sendTimeTotalUs();
+                previousSendTimeSamples = writer.sendTimeSamples();
+                previousQueueDrops = queueDrops;
+                previousDriverFrames = driverFrames;
+                previousDriverCopyUs = driverCopyUs;
+                previousDriverMapUs = driverMapUs;
+                previousDriverConvertUs = driverConvertUs;
+                nextStatsLogUs = nowUs + 5'000'000;
+            };
+
+            OwnedFrame frame;
+            bool reachedFrameLimit = false;
+            while (!g_stop.load()) {
+                const LatestFrameQueue::Item item = queue.Wait(frame);
+                if (item == LatestFrameQueue::Item::Closed) {
+                    break;
+                }
+                if (item == LatestFrameQueue::Item::Heartbeat) {
+                    if (!writer.SendHeartbeat()) {
+                        throw std::runtime_error(writer.error());
+                    }
+                    logStats();
+                    continue;
+                }
+                const CapturedFrame view = frame.View();
+                const std::uint64_t startedUs = NowMicros();
+                if (!encoder.EncodeFrame(writer, view)) {
+                    throw std::runtime_error(writer.error());
+                }
+                const std::uint64_t durationUs = NowMicros() - startedUs;
+                encodeCallTotalUs += durationUs;
+                encodeCallMaxUs = std::max(encodeCallMaxUs, durationUs);
+                ++encodeCallSamples;
+                const std::uint64_t encoded = state.encodedFrames.fetch_add(1) + 1;
+                logStats();
+                if (config.frames != 0 && encoded >= config.frames) {
+                    if (!encoder.Drain(writer)) {
+                        throw std::runtime_error(writer.error());
+                    }
+                    encoder.Flush();
+                    reachedFrameLimit = true;
+                    state.stopCapture.store(true);
+                    queue.Abort();
+                    break;
+                }
+            }
+            if (!reachedFrameLimit) {
+                encoder.Flush();
+            }
+        } catch (const std::exception& error) {
+            state.workerFailed.store(true);
+            state.stopCapture.store(true);
+            state.SetWorkerError(error.what());
+            queue.Abort();
+            shutdown(socket, SD_BOTH);
+            std::cerr << "[CLIENT] stream worker stopped: " << error.what() << '\n';
+        }
+        if (workerComInitialized) {
+            CoUninitialize();
+        }
+    });
+
+    while (!g_stop.load() && !state.stopCapture.load() &&
+           (config.frames == 0 || state.encodedFrames.load() < config.frames)) {
+        CapturedFrame frame;
+        const FrameRingReader::Result result = reader.WaitForFrame(socket, frame, &state.stopCapture);
+        if (result == FrameRingReader::Result::Heartbeat) {
+            if (!queue.PublishHeartbeat()) {
+                break;
+            }
+            updateCaptureStats();
             continue;
         }
         if (result != FrameRingReader::Result::Frame) {
@@ -2816,20 +3082,16 @@ void StreamClient(
             } else if (result == FrameRingReader::Result::Disconnected) {
                 std::cerr << "[CLIENT] disconnected while waiting for frame\n";
             }
-            return;
+            break;
         }
-        if (!encodeFrame(frame)) {
-            std::cerr << "[CLIENT] stream stopped: " << writer.error() << '\n';
-            return;
+        if (!queue.Publish(frame)) {
+            break;
         }
-        ++encodedFrames;
-        logStats();
+        updateCaptureStats();
     }
-    if (!g_stop.load() && !encoder.Drain(writer)) {
-        std::cerr << "[CLIENT] drain stopped: " << writer.error() << '\n';
-        return;
-    }
-    encoder.Flush();
+    queue.Close();
+    worker.join();
+    encodedFrames = state.encodedFrames.load();
 }
 } // namespace
 

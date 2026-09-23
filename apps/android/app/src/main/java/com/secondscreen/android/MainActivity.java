@@ -57,7 +57,6 @@ public final class MainActivity extends Activity implements ConnectionManager.Li
         root.setBackgroundColor(Color.BLACK);
 
         surfaceView = new SurfaceView(this);
-        surfaceView.setZOrderOnTop(true);
         surfaceView.setFocusable(false);
         surfaceView.setOnClickListener(view -> toggleStats());
         surfaceView.getHolder().addCallback(new SurfaceHolder.Callback() {

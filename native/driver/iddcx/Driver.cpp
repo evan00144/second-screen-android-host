@@ -1,7 +1,9 @@
 #include "Driver.h"
 
+#include <emmintrin.h>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <new>
 #include <utility>
@@ -56,6 +58,21 @@ std::uint64_t QpcToMicroseconds(UINT64 qpc) noexcept
     return seconds * 1'000'000 + (remainder * 1'000'000) / ticksPerSecond;
 }
 
+UINT64 QueryQpc() noexcept
+{
+    LARGE_INTEGER value{};
+    return QueryPerformanceCounter(&value) ? static_cast<UINT64>(value.QuadPart) : 0;
+}
+
+std::uint64_t QpcDeltaToMicroseconds(UINT64 start, UINT64 end) noexcept
+{
+    if (start == 0 || end <= start)
+    {
+        return 0;
+    }
+    return QpcToMicroseconds(end) - QpcToMicroseconds(start);
+}
+
 FrameSlot* ClaimFrameSlot(FrameRing* ring) noexcept
 {
     for (UINT attempt = 0; attempt < UsbMonitorFrameRing::kSlotCount + 1; ++attempt)
@@ -96,6 +113,24 @@ FrameSlot* ClaimFrameSlot(FrameRing* ring) noexcept
     return nullptr;
 }
 
+void LoadBgraChannels16(
+    const std::uint8_t* source,
+    const __m128i& channelMask,
+    const __m128i& zero,
+    __m128i& blue,
+    __m128i& green,
+    __m128i& red) noexcept
+{
+    const __m128i pixels = _mm_loadu_si128(reinterpret_cast<const __m128i*>(source));
+    blue = _mm_packs_epi32(_mm_and_si128(pixels, channelMask), zero);
+    green = _mm_packs_epi32(
+        _mm_and_si128(_mm_srli_epi32(pixels, 8), channelMask),
+        zero);
+    red = _mm_packs_epi32(
+        _mm_and_si128(_mm_srli_epi32(pixels, 16), channelMask),
+        zero);
+}
+
 void ConvertBgraToNv12(
     const D3D11_MAPPED_SUBRESOURCE& mapped,
     UINT width,
@@ -106,12 +141,55 @@ void ConvertBgraToNv12(
     const std::size_t yPlaneBytes = static_cast<std::size_t>(width) * height;
     auto* yPlane = slot->payload;
     auto* uvPlane = slot->payload + yPlaneBytes;
+    const __m128i zero = _mm_setzero_si128();
+    const __m128i channelMask = _mm_set1_epi32(0xff);
+    const __m128i yBlueCoefficient = _mm_set1_epi16(25);
+    const __m128i yGreenCoefficient = _mm_set1_epi16(129);
+    const __m128i yRedCoefficient = _mm_set1_epi16(66);
+    const __m128i uvPairSums = _mm_set1_epi16(1);
+    const __m128i uRedCoefficient = _mm_set1_epi16(-38);
+    const __m128i uGreenCoefficient = _mm_set1_epi16(-74);
+    const __m128i uBlueCoefficient = _mm_set1_epi16(112);
+    const __m128i vRedCoefficient = _mm_set1_epi16(112);
+    const __m128i vGreenCoefficient = _mm_set1_epi16(-94);
+    const __m128i vBlueCoefficient = _mm_set1_epi16(-18);
+    const __m128i bias128 = _mm_set1_epi16(128);
 
     for (UINT y = 0; y < height; ++y)
     {
         const auto* sourceRow = source + static_cast<std::size_t>(y) * mapped.RowPitch;
         auto* destinationRow = yPlane + static_cast<std::size_t>(y) * width;
-        for (UINT x = 0; x < width; ++x)
+        UINT x = 0;
+        for (; x + 4 <= width; x += 4)
+        {
+            __m128i blue;
+            __m128i green;
+            __m128i red;
+            LoadBgraChannels16(sourceRow + static_cast<std::size_t>(x) * 4,
+                               channelMask,
+                               zero,
+                               blue,
+                               green,
+                               red);
+            const __m128i blueProduct = _mm_unpacklo_epi16(
+                _mm_mullo_epi16(blue, yBlueCoefficient),
+                zero);
+            const __m128i greenProduct = _mm_unpacklo_epi16(
+                _mm_mullo_epi16(green, yGreenCoefficient),
+                zero);
+            const __m128i redProduct = _mm_unpacklo_epi16(
+                _mm_mullo_epi16(red, yRedCoefficient),
+                zero);
+            __m128i yValues = _mm_add_epi32(
+                _mm_add_epi32(blueProduct, greenProduct),
+                redProduct);
+            yValues = _mm_srli_epi32(_mm_add_epi32(yValues, _mm_set1_epi32(128)), 8);
+            yValues = _mm_add_epi32(yValues, _mm_set1_epi32(16));
+            const __m128i yBytes = _mm_packus_epi16(_mm_packs_epi32(yValues, zero), zero);
+            const std::uint32_t packed = static_cast<std::uint32_t>(_mm_cvtsi128_si32(yBytes));
+            std::memcpy(destinationRow + x, &packed, sizeof(packed));
+        }
+        for (; x < width; ++x)
         {
             const auto* pixel = sourceRow + static_cast<std::size_t>(x) * 4;
             const int blue = pixel[0];
@@ -126,7 +204,62 @@ void ConvertBgraToNv12(
         const auto* row0 = source + static_cast<std::size_t>(y) * mapped.RowPitch;
         const auto* row1 = source + static_cast<std::size_t>(y + 1) * mapped.RowPitch;
         auto* destinationRow = uvPlane + static_cast<std::size_t>(y / 2) * width;
-        for (UINT x = 0; x < width; x += 2)
+        UINT x = 0;
+        for (; x + 4 <= width; x += 4)
+        {
+            __m128i blue0;
+            __m128i green0;
+            __m128i red0;
+            __m128i blue1;
+            __m128i green1;
+            __m128i red1;
+            LoadBgraChannels16(row0 + static_cast<std::size_t>(x) * 4,
+                               channelMask,
+                               zero,
+                               blue0,
+                               green0,
+                               red0);
+            LoadBgraChannels16(row1 + static_cast<std::size_t>(x) * 4,
+                               channelMask,
+                               zero,
+                               blue1,
+                               green1,
+                               red1);
+            const __m128i blueSums = _mm_madd_epi16(
+                _mm_add_epi16(blue0, blue1),
+                uvPairSums);
+            const __m128i greenSums = _mm_madd_epi16(
+                _mm_add_epi16(green0, green1),
+                uvPairSums);
+            const __m128i redSums = _mm_madd_epi16(
+                _mm_add_epi16(red0, red1),
+                uvPairSums);
+            const __m128i blueAverage = _mm_srli_epi16(
+                _mm_packs_epi32(blueSums, zero),
+                2);
+            const __m128i greenAverage = _mm_srli_epi16(
+                _mm_packs_epi32(greenSums, zero),
+                2);
+            const __m128i redAverage = _mm_srli_epi16(
+                _mm_packs_epi32(redSums, zero),
+                2);
+            __m128i uValues = _mm_add_epi16(
+                _mm_add_epi16(
+                    _mm_mullo_epi16(redAverage, uRedCoefficient),
+                    _mm_mullo_epi16(greenAverage, uGreenCoefficient)),
+                _mm_mullo_epi16(blueAverage, uBlueCoefficient));
+            uValues = _mm_add_epi16(_mm_srai_epi16(_mm_add_epi16(uValues, bias128), 8), bias128);
+            __m128i vValues = _mm_add_epi16(
+                _mm_add_epi16(
+                    _mm_mullo_epi16(redAverage, vRedCoefficient),
+                    _mm_mullo_epi16(greenAverage, vGreenCoefficient)),
+                _mm_mullo_epi16(blueAverage, vBlueCoefficient));
+            vValues = _mm_add_epi16(_mm_srai_epi16(_mm_add_epi16(vValues, bias128), 8), bias128);
+            const __m128i uvBytes = _mm_packus_epi16(_mm_unpacklo_epi16(uValues, vValues), zero);
+            const std::uint32_t packed = static_cast<std::uint32_t>(_mm_cvtsi128_si32(uvBytes));
+            std::memcpy(destinationRow + x, &packed, sizeof(packed));
+        }
+        for (; x < width; x += 2)
         {
             int blue = 0;
             int green = 0;
@@ -512,15 +645,20 @@ bool SwapChainProcessor::CaptureAndPublish(
     {
         return false;
     }
+    const UINT64 copyStartQpc = QueryQpc();
     m_Device->DeviceContext->CopyResource(m_StagingTexture.Get(), sourceTexture.Get());
+    const UINT64 copyEndQpc = QueryQpc();
 
     D3D11_MAPPED_SUBRESOURCE mapped{};
-    if (FAILED(m_Device->DeviceContext->Map(
+    const UINT64 mapStartQpc = QueryQpc();
+    const HRESULT mapResult = m_Device->DeviceContext->Map(
         m_StagingTexture.Get(),
         0,
         D3D11_MAP_READ,
         0,
-        &mapped)))
+        &mapped);
+    const UINT64 mapEndQpc = QueryQpc();
+    if (FAILED(mapResult))
     {
         return false;
     }
@@ -559,8 +697,22 @@ bool SwapChainProcessor::CaptureAndPublish(
     slot->stride = width;
     slot->payloadLength = static_cast<std::uint32_t>(
         static_cast<std::size_t>(width) * height * 3 / 2);
+    const UINT64 convertStartQpc = QueryQpc();
     ConvertBgraToNv12(mapped, width, height, slot);
+    const UINT64 convertEndQpc = QueryQpc();
     m_Device->DeviceContext->Unmap(m_StagingTexture.Get(), 0);
+
+    InterlockedExchangeAdd64(
+        reinterpret_cast<volatile LONG64*>(&m_FrameRing->telemetry.copyTotalUs),
+        static_cast<LONG64>(QpcDeltaToMicroseconds(copyStartQpc, copyEndQpc)));
+    InterlockedExchangeAdd64(
+        reinterpret_cast<volatile LONG64*>(&m_FrameRing->telemetry.mapTotalUs),
+        static_cast<LONG64>(QpcDeltaToMicroseconds(mapStartQpc, mapEndQpc)));
+    InterlockedExchangeAdd64(
+        reinterpret_cast<volatile LONG64*>(&m_FrameRing->telemetry.convertTotalUs),
+        static_cast<LONG64>(QpcDeltaToMicroseconds(convertStartQpc, convertEndQpc)));
+    InterlockedIncrement64(
+        reinterpret_cast<volatile LONG64*>(&m_FrameRing->telemetry.framesPublished));
 
     InterlockedExchange(
         reinterpret_cast<volatile LONG*>(&slot->state),

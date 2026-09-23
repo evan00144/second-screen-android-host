@@ -111,12 +111,16 @@ final class ConnectionManager {
 
     private void runConnectionLoop(long token) {
         while (isCurrent(token)) {
+            Socket socket = null;
             StreamReceiver receiver = null;
             String reconnectReason = null;
             try {
                 notifyConnecting(token);
-                Socket socket = connectSocket();
-                activeSocket = socket;
+                socket = connectSocket();
+                if (!installActiveSocket(token, socket)) {
+                    closeQuietly(socket);
+                    return;
+                }
                 BufferedInputStream input = new BufferedInputStream(socket.getInputStream(), 8 * 1024);
                 ConnectionInfo info = performHandshake(input, socket.getOutputStream());
                 if (!isCurrent(token)) {
@@ -124,7 +128,10 @@ final class ConnectionManager {
                     return;
                 }
                 receiver = new StreamReceiver(socket, input, surface, info, stats);
-                activeReceiver = receiver;
+                if (!installActiveReceiver(token, socket, receiver)) {
+                    receiver.close();
+                    return;
+                }
                 streamStarted = true;
                 notifyConnected(token, info);
                 receiver.run();
@@ -139,8 +146,7 @@ final class ConnectionManager {
                 if (receiver != null) {
                     receiver.close();
                 }
-                activeReceiver = null;
-                closeActiveSocket();
+                clearActiveResources(socket, receiver);
             }
 
             if (!isCurrent(token)) {
@@ -307,6 +313,40 @@ final class ConnectionManager {
             receiver.close();
         }
         closeActiveSocket();
+    }
+
+    private boolean installActiveSocket(long token, Socket socket) {
+        synchronized (lock) {
+            if (closed || !running || generation != token) {
+                return false;
+            }
+            activeSocket = socket;
+            return true;
+        }
+    }
+
+    private boolean installActiveReceiver(long token, Socket socket, StreamReceiver receiver) {
+        synchronized (lock) {
+            if (closed || !running || generation != token || activeSocket != socket) {
+                return false;
+            }
+            activeReceiver = receiver;
+            return true;
+        }
+    }
+
+    private void clearActiveResources(Socket socket, StreamReceiver receiver) {
+        synchronized (lock) {
+            if (activeReceiver == receiver) {
+                activeReceiver = null;
+            }
+            if (activeSocket == socket) {
+                activeSocket = null;
+            }
+        }
+        if (socket != null) {
+            closeQuietly(socket);
+        }
     }
 
     private void closeActiveSocket() {

@@ -39,6 +39,16 @@ struct alignas(64) FrameSlot
     std::uint8_t payload[kMaxPayloadBytes]{};
 };
 
+struct alignas(8) FrameRingTelemetry
+{
+    volatile std::uint64_t framesPublished{};
+    volatile std::uint64_t copyTotalUs{};
+    volatile std::uint64_t mapTotalUs{};
+    volatile std::uint64_t convertTotalUs{};
+};
+
+static_assert(sizeof(FrameRingTelemetry) == sizeof(std::uint64_t) * 4, "Frame telemetry layout must stay compact.");
+
 struct alignas(64) FrameRing
 {
     std::uint32_t magic{};
@@ -49,7 +59,7 @@ struct alignas(64) FrameRing
     std::uint32_t maxWidth{};
     std::uint32_t maxHeight{};
     volatile std::int32_t ready{};
-    std::uint32_t reserved[8]{};
+    FrameRingTelemetry telemetry{};
     FrameSlot slots[kSlotCount]{};
 };
 
