@@ -145,12 +145,35 @@ Exit condition: 30-second 1920x1200 run reaches at least 55 video FPS with outpu
 Status: implementation complete; runtime validation pending.
 
 - Poll the Windows cursor on the host at low latency and coalesce unchanged positions.
+- Normalize monitor coordinates to the encoded stream dimensions before sending them.
 - Send cursor visibility and coordinates as small SSV1 control packets outside the H.264 queue.
-- Render a lightweight cursor overlay above the Android `SurfaceView`.
+- Render a lightweight cursor overlay above the Android `SurfaceView`, matching its X/Y presentation scale.
 - Report cursor packet/update deltas and expose current-window FPS/bitrate in the Android overlay.
 - Keep tablet-to-Windows input injection out of scope.
 
 Exit condition: cursor movement remains responsive while video keeps its existing frame/drop/reconnect behavior.
+
+## Phase 10: Pipelined D3D11 Readback
+
+Status: implementation complete; runtime validation pending.
+
+- Queue the next GPU staging copy before mapping and converting the previous frame.
+- Keep the first published frame synchronous so a static display does not start black.
+- Flush one pending staging frame during swap-chain shutdown or resolution changes.
+- Preserve the existing FrameRing format and driver telemetry.
+
+Exit condition: 30-second 1920x1200 run at 60 Hz reaches at least 55 capture FPS without increasing queue drops, send timeouts, or reconnects.
+
+## Phase 11: Idle Frame Refresh
+
+Status: implementation complete; runtime validation pending.
+
+- Re-encode the latest captured frame at 30 FPS after one refresh interval without a new FrameRing frame.
+- Keep idle-refresh deadlines cadence-anchored, skipping missed deadlines instead of accumulating timer drift.
+- Keep captured-frame cadence telemetry separate from idle refresh telemetry.
+- Preserve heartbeats for connection watchdog behavior.
+
+Exit condition: idle desktop text input remains responsive without increasing reconnects, send timeouts, or decoder starvation.
 
 ## Commit Sequence
 

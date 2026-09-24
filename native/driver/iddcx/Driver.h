@@ -30,6 +30,15 @@ struct Direct3DDevice
     ComPtr<ID3D11DeviceContext> DeviceContext;
 };
 
+struct PendingStagingFrame
+{
+    UINT stagingIndex{};
+    UINT width{};
+    UINT height{};
+    UINT64 presentDisplayQpcTime{};
+    std::uint64_t copyDurationUs{};
+};
+
 class SwapChainProcessor
 {
 public:
@@ -50,12 +59,7 @@ private:
     bool EnsureFrameRing();
     void CloseFrameRing() noexcept;
     bool EnsureStagingTextures(UINT width, UINT height);
-    bool MapAndPublishStagingFrame(
-        UINT stagingIndex,
-        UINT width,
-        UINT height,
-        UINT64 presentDisplayQpcTime,
-        std::uint64_t copyDurationUs);
+    bool MapAndPublishStagingFrame(const PendingStagingFrame& frame);
     bool CaptureAndPublish(
         ComPtr<IDXGIResource>& surface,
         UINT64 presentDisplayQpcTime);
@@ -74,6 +78,9 @@ private:
     UINT m_StagingWidth{};
     UINT m_StagingHeight{};
     UINT m_StagingWriteIndex{};
+    PendingStagingFrame m_PendingStagingFrame{};
+    bool m_HasPendingStagingFrame{};
+    bool m_HasPublishedFrame{};
     std::unique_ptr<std::uint8_t[]> m_CursorShapeBuffer;
     DWORD m_LastCursorShapeId{};
     std::uint64_t m_NextFrameId{1};

@@ -65,6 +65,7 @@ constexpr size_t kCursorControlPayloadBytes = 32;
 constexpr uint32_t kNvencPicFlagForceIdr = 0x2;
 constexpr uint32_t kNvencPicFlagOutputSpsPps = 0x4;
 constexpr uint64_t kHeartbeatIntervalUs = 1'000'000;
+constexpr uint64_t kIdleRefreshIntervalUs = 1'000'000 / 30;
 
 std::atomic_bool g_stop{false};
 std::atomic<SOCKET> g_listener{INVALID_SOCKET};
@@ -625,6 +626,53 @@ bool ReadHandshake(SOCKET socket, std::string& line, std::string& error) {
 
 std::uint64_t NowMicros();
 
+struct CadenceSnapshot final {
+    std::uint64_t p50Us = 0;
+    std::uint64_t p95Us = 0;
+    std::uint64_t maxUs = 0;
+};
+
+class CadenceWindow final {
+public:
+    CadenceWindow() {
+        intervalsUs_.reserve(512);
+    }
+
+    void Record(std::uint64_t timestampUs) {
+        if (timestampUs == 0) {
+            return;
+        }
+        std::lock_guard lock(mutex_);
+        if (lastTimestampUs_ != 0 && timestampUs > lastTimestampUs_) {
+            const std::uint64_t intervalUs = timestampUs - lastTimestampUs_;
+            if (intervalUs <= 2'000'000) {
+                intervalsUs_.push_back(intervalUs);
+            }
+        }
+        lastTimestampUs_ = timestampUs;
+    }
+
+    CadenceSnapshot SnapshotAndReset() {
+        std::lock_guard lock(mutex_);
+        if (intervalsUs_.empty()) {
+            return {};
+        }
+
+        std::sort(intervalsUs_.begin(), intervalsUs_.end());
+        CadenceSnapshot snapshot{};
+        snapshot.p50Us = intervalsUs_[(intervalsUs_.size() - 1) * 50 / 100];
+        snapshot.p95Us = intervalsUs_[(intervalsUs_.size() - 1) * 95 / 100];
+        snapshot.maxUs = intervalsUs_.back();
+        intervalsUs_.clear();
+        return snapshot;
+    }
+
+private:
+    std::mutex mutex_;
+    std::vector<std::uint64_t> intervalsUs_;
+    std::uint64_t lastTimestampUs_ = 0;
+};
+
 class PacketWriter {
 public:
     PacketWriter() = default;
@@ -667,6 +715,7 @@ private:
         if (frameId == 0 && payloadLength == 0) {
             ++heartbeatPacketsSent_;
         } else {
+            videoCadence_.Record(NowMicros());
             ++videoPacketsSent_;
             videoBytesSent_ += payloadLength;
             if (ContainsNalType(payload, payloadLength, 5)) {
@@ -756,6 +805,7 @@ public:
     std::uint64_t sendTimeTotalUs() const { std::lock_guard lock(mutex_); return sendTimeTotalUs_; }
     std::uint64_t sendTimeMaxUs() const { std::lock_guard lock(mutex_); return sendTimeMaxUs_; }
     std::uint64_t sendTimeSamples() const { std::lock_guard lock(mutex_); return sendTimeSamples_; }
+    CadenceSnapshot TakeVideoCadence() { std::lock_guard lock(mutex_); return videoCadence_.SnapshotAndReset(); }
 
 private:
     mutable std::mutex mutex_;
@@ -771,6 +821,7 @@ private:
     std::uint64_t sendTimeTotalUs_ = 0;
     std::uint64_t sendTimeMaxUs_ = 0;
     std::uint64_t sendTimeSamples_ = 0;
+    CadenceWindow videoCadence_;
 
     static void WriteLe32(uint8_t* destination, uint32_t value) {
         for (unsigned i = 0; i < 4; ++i) {
@@ -1357,6 +1408,7 @@ public:
     enum class Item {
         Frame,
         Heartbeat,
+        Timeout,
         Closed,
     };
 
@@ -1390,11 +1442,13 @@ public:
         return true;
     }
 
-    Item Wait(OwnedFrame& output) {
+    Item WaitFor(OwnedFrame& output, std::chrono::milliseconds timeout) {
         std::unique_lock lock(mutex_);
-        cv_.wait(lock, [this] {
+        if (!cv_.wait_for(lock, timeout, [this] {
             return hasPending_ || heartbeatPending_ || closed_ || aborted_;
-        });
+        })) {
+            return Item::Timeout;
+        }
         if (hasPending_) {
             output.Swap(pending_);
             hasPending_ = false;
@@ -1405,6 +1459,16 @@ public:
             return Item::Heartbeat;
         }
         return Item::Closed;
+    }
+
+    bool TakePending(OwnedFrame& output) {
+        std::lock_guard lock(mutex_);
+        if (!hasPending_) {
+            return false;
+        }
+        output.Swap(pending_);
+        hasPending_ = false;
+        return true;
     }
 
     void Close() {
@@ -2995,10 +3059,20 @@ public:
         std::int32_t x = 0;
         std::int32_t y = 0;
         if (visible) {
-            x = static_cast<std::int32_t>(cursorPosition.x - targetRect.left);
-            y = static_cast<std::int32_t>(cursorPosition.y - targetRect.top);
-            x = std::clamp<std::int32_t>(x, 0, static_cast<std::int32_t>(width_ - 1));
-            y = std::clamp<std::int32_t>(y, 0, static_cast<std::int32_t>(height_ - 1));
+            const LONG monitorWidth = std::max<LONG>(1, targetRect.right - targetRect.left);
+            const LONG monitorHeight = std::max<LONG>(1, targetRect.bottom - targetRect.top);
+            const LONG monitorX = std::clamp<LONG>(
+                cursorPosition.x - targetRect.left,
+                0,
+                monitorWidth - 1);
+            const LONG monitorY = std::clamp<LONG>(
+                cursorPosition.y - targetRect.top,
+                0,
+                monitorHeight - 1);
+            x = static_cast<std::int32_t>(
+                static_cast<std::int64_t>(monitorX) * width_ / monitorWidth);
+            y = static_cast<std::int32_t>(
+                static_cast<std::int64_t>(monitorY) * height_ / monitorHeight);
         }
 
         if (!hasState_ || visible != lastVisible_ || x != lastX_ || y != lastY_) {
@@ -3269,6 +3343,7 @@ void StreamClient(
 
     LatestFrameQueue queue;
     AsyncStreamState state;
+    CadenceWindow captureCadence;
     const auto updateCaptureStats = [&]() {
         const FrameRingStats stats = reader.stats();
         const FrameRingDriverStats driverStats = reader.driverStats();
@@ -3282,6 +3357,7 @@ void StreamClient(
     if (!queue.Publish(firstFrame)) {
         return;
     }
+    captureCadence.Record(firstFrame.captureTimestampUs);
     updateCaptureStats();
 
     PacketWriter writer(socket);
@@ -3334,6 +3410,11 @@ void StreamClient(
             std::uint64_t previousDriverCopyUs = 0;
             std::uint64_t previousDriverMapUs = 0;
             std::uint64_t previousDriverConvertUs = 0;
+            std::uint64_t latestReplaced = 0;
+            std::uint64_t previousLatestReplaced = 0;
+            std::uint64_t idleRefreshes = 0;
+            std::uint64_t previousIdleRefreshes = 0;
+            CadenceWindow encodeCadence;
             NvencTimingStats previousNvencTiming{};
             const auto logStats = [&] {
                 const std::uint64_t nowUs = NowMicros();
@@ -3361,6 +3442,7 @@ void StreamClient(
                 const std::uint64_t heartbeatDelta = writer.heartbeatPacketsSent() - previousHeartbeats;
                 const std::uint64_t cursorPackets = writer.cursorPacketsSent();
                 const std::uint64_t cursorDelta = cursorPackets - previousCursorPackets;
+                const std::uint64_t idleRefreshDelta = idleRefreshes - previousIdleRefreshes;
                 const std::uint64_t encodeSamplesDelta = encodeCallSamples - previousEncodeCallSamples;
                 const std::uint64_t sendSamplesDelta = writer.sendTimeSamples() - previousSendTimeSamples;
                 const std::uint64_t encodeTimeDelta = encodeCallTotalUs - previousEncodeCallTotalUs;
@@ -3400,6 +3482,22 @@ void StreamClient(
                     nvencTiming.pollBusy,
                     previousNvencTiming.pollBusy);
                 const std::uint64_t queueDrops = queue.droppedFrames();
+                const CadenceSnapshot captureCadenceSnapshot = captureCadence.SnapshotAndReset();
+                const CadenceSnapshot encodeCadenceSnapshot = encodeCadence.SnapshotAndReset();
+                const CadenceSnapshot sendCadenceSnapshot = writer.TakeVideoCadence();
+                const std::uint64_t latestReplacedDelta = counterDelta(
+                    latestReplaced,
+                    previousLatestReplaced);
+                const double captureFps = captureDelta / elapsedSeconds;
+                const double encodeFps = encodeSamplesDelta / elapsedSeconds;
+                const double videoFps = videoDelta / elapsedSeconds;
+                const double cadenceWarningFps = std::max(1.0, effectiveConfig.fps * 5.0 / 6.0);
+                if (videoDelta != 0 && videoFps < cadenceWarningFps) {
+                    std::cerr << "[WARN] frame cadence below target: capture_fps="
+                              << captureFps << " encode_fps=" << encodeFps
+                              << " video_fps=" << videoFps << " target_fps="
+                              << cadenceWarningFps << '\n';
+                }
                 std::cout << "[STATS] capture=" << capture
                           << " skipped=" << skipped
                           << " video=" << writer.videoPacketsSent()
@@ -3409,9 +3507,11 @@ void StreamClient(
                           << " send_fail=" << writer.sendFailures()
                           << " send_timeout=" << writer.sendTimeouts()
                           << " window_s=" << elapsedSeconds
-                          << " capture_fps=" << captureDelta / elapsedSeconds
+                          << " capture_fps=" << captureFps
                           << " driver_fps=" << driverFrameDelta / elapsedSeconds
-                          << " video_fps=" << videoDelta / elapsedSeconds
+                          << " encode_fps=" << encodeFps
+                          << " send_fps=" << videoFps
+                          << " video_fps=" << videoFps
                           << " skipped_delta=" << skippedDelta
                           << " bytes_mbps=" << bytesDelta * 8.0 / elapsedSeconds / 1'000'000.0
                           << " heartbeat_delta=" << heartbeatDelta
@@ -3420,6 +3520,18 @@ void StreamClient(
                           << " queue_drop=" << queueDrops
                           << " queue_drop_delta=" << (queueDrops - previousQueueDrops)
                           << " queue_pending=" << (queue.pending() ? 1 : 0)
+                          << " latest_replace_delta=" << latestReplacedDelta
+                          << " idle_refresh=" << idleRefreshes
+                          << " idle_refresh_delta=" << idleRefreshDelta
+                          << " capture_interval_p50_ms=" << captureCadenceSnapshot.p50Us / 1'000.0
+                          << " capture_interval_p95_ms=" << captureCadenceSnapshot.p95Us / 1'000.0
+                          << " capture_interval_max_ms=" << captureCadenceSnapshot.maxUs / 1'000.0
+                          << " encode_interval_p50_ms=" << encodeCadenceSnapshot.p50Us / 1'000.0
+                          << " encode_interval_p95_ms=" << encodeCadenceSnapshot.p95Us / 1'000.0
+                          << " encode_interval_max_ms=" << encodeCadenceSnapshot.maxUs / 1'000.0
+                          << " send_interval_p50_ms=" << sendCadenceSnapshot.p50Us / 1'000.0
+                          << " send_interval_p95_ms=" << sendCadenceSnapshot.p95Us / 1'000.0
+                          << " send_interval_max_ms=" << sendCadenceSnapshot.maxUs / 1'000.0
                           << " driver_copy_avg_ms="
                           << (driverFrameDelta == 0 ? 0.0 : driverCopyDeltaUs / driverFrameDelta / 1'000.0)
                           << " driver_map_avg_ms="
@@ -3475,24 +3587,21 @@ void StreamClient(
                 previousDriverCopyUs = driverCopyUs;
                 previousDriverMapUs = driverMapUs;
                 previousDriverConvertUs = driverConvertUs;
+                previousLatestReplaced = latestReplaced;
+                previousIdleRefreshes = idleRefreshes;
                 previousNvencTiming = nvencTiming;
                 nextStatsLogUs = nowUs + 5'000'000;
             };
 
             OwnedFrame frame;
             bool reachedFrameLimit = false;
-            while (!g_stop.load()) {
-                const LatestFrameQueue::Item item = queue.Wait(frame);
-                if (item == LatestFrameQueue::Item::Closed) {
-                    break;
+            bool hasFrame = false;
+            std::uint64_t nextIdleRefreshUs = 0;
+            const auto encodeCurrentFrame = [&](bool idleRefresh) {
+                if (g_stop.load() || state.stopCapture.load()) {
+                    return;
                 }
-                if (item == LatestFrameQueue::Item::Heartbeat) {
-                    if (!writer.SendHeartbeat()) {
-                        throw std::runtime_error(writer.error());
-                    }
-                    logStats();
-                    continue;
-                }
+                encodeCadence.Record(NowMicros());
                 const CapturedFrame view = frame.View();
                 const std::uint64_t startedUs = NowMicros();
                 if (!encoder.EncodeFrame(writer, view)) {
@@ -3502,6 +3611,9 @@ void StreamClient(
                 encodeCallTotalUs += durationUs;
                 encodeCallMaxUs = std::max(encodeCallMaxUs, durationUs);
                 ++encodeCallSamples;
+                if (idleRefresh) {
+                    ++idleRefreshes;
+                }
                 const std::uint64_t encoded = state.encodedFrames.fetch_add(1) + 1;
                 logStats();
                 if (config.frames != 0 && encoded >= config.frames) {
@@ -3512,6 +3624,53 @@ void StreamClient(
                     reachedFrameLimit = true;
                     state.stopCapture.store(true);
                     queue.Abort();
+                }
+            };
+            while (!g_stop.load()) {
+                const std::uint64_t nowUs = NowMicros();
+                const std::uint64_t waitUs = hasFrame && nextIdleRefreshUs > nowUs
+                    ? nextIdleRefreshUs - nowUs
+                    : hasFrame ? 0 : kHeartbeatIntervalUs;
+                const auto waitMs = std::chrono::milliseconds(static_cast<std::int64_t>(
+                    std::min<std::uint64_t>(1'000, std::max<std::uint64_t>(1, (waitUs + 999) / 1'000))));
+                const LatestFrameQueue::Item item = queue.WaitFor(frame, waitMs);
+                if (item == LatestFrameQueue::Item::Closed) {
+                    break;
+                }
+                if (item == LatestFrameQueue::Item::Timeout) {
+                    if (config.frames == 0 && hasFrame && NowMicros() >= nextIdleRefreshUs) {
+                        const std::uint64_t refreshDeadlineUs = nextIdleRefreshUs;
+                        encodeCurrentFrame(true);
+                        const std::uint64_t nowAfterRefreshUs = NowMicros();
+                        nextIdleRefreshUs = refreshDeadlineUs + kIdleRefreshIntervalUs;
+                        if (nextIdleRefreshUs <= nowAfterRefreshUs) {
+                            nextIdleRefreshUs = nowAfterRefreshUs + kIdleRefreshIntervalUs;
+                        }
+                    }
+                    if (reachedFrameLimit) {
+                        break;
+                    }
+                    continue;
+                }
+                if (item == LatestFrameQueue::Item::Heartbeat) {
+                    if (!writer.SendHeartbeat()) {
+                        throw std::runtime_error(writer.error());
+                    }
+                    logStats();
+                    continue;
+                }
+                while (true) {
+                    OwnedFrame latest;
+                    if (!queue.TakePending(latest)) {
+                        break;
+                    }
+                    frame.Swap(latest);
+                    ++latestReplaced;
+                }
+                hasFrame = true;
+                encodeCurrentFrame(false);
+                nextIdleRefreshUs = NowMicros() + kIdleRefreshIntervalUs;
+                if (reachedFrameLimit) {
                     break;
                 }
             }
@@ -3550,6 +3709,7 @@ void StreamClient(
             }
             break;
         }
+        captureCadence.Record(frame.captureTimestampUs);
         if (!queue.Publish(frame)) {
             break;
         }

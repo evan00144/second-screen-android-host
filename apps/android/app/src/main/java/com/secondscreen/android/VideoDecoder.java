@@ -118,7 +118,7 @@ final class VideoDecoder {
         if (frame.randomAccess) {
             waitingForRandomAccess = false;
         }
-        drainOutput();
+        drainOutput(0);
         int inputIndex;
         try {
             inputIndex = codec.dequeueInputBuffer(INPUT_TIMEOUT_US);
@@ -149,17 +149,21 @@ final class VideoDecoder {
         } catch (RuntimeException e) {
             throw new IOException("MediaCodec input queue failed: " + e.getMessage(), e);
         }
-        drainOutput();
+        drainOutput(INPUT_TIMEOUT_US);
         return true;
     }
 
-    private void drainOutput() throws IOException {
+    private void drainOutput(long firstPollTimeoutUs) throws IOException {
         MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
         int pendingOutputIndex = -1;
+        boolean firstPoll = true;
         while (true) {
             final int outputIndex;
             try {
-                outputIndex = codec.dequeueOutputBuffer(bufferInfo, 0);
+                outputIndex = codec.dequeueOutputBuffer(
+                        bufferInfo,
+                        firstPoll ? firstPollTimeoutUs : 0);
+                firstPoll = false;
             } catch (RuntimeException e) {
                 throw new IOException("MediaCodec output dequeue failed: " + e.getMessage(), e);
             }

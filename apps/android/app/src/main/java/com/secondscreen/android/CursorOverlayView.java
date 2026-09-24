@@ -55,12 +55,10 @@ final class CursorOverlayView extends View {
         }
         float scaleX = getWidth() / (float) streamWidth;
         float scaleY = getHeight() / (float) streamHeight;
-        float scale = Math.min(scaleX, scaleY);
-        float offsetX = (getWidth() - streamWidth * scale) * 0.5f;
-        float offsetY = (getHeight() - streamHeight * scale) * 0.5f;
-        float x = offsetX + cursorX * scale;
-        float y = offsetY + cursorY * scale;
-        float size = Math.max(16f, 28f * scale);
+        float x = cursorX * scaleX;
+        float y = cursorY * scaleY;
+        float cursorScale = Math.min(scaleX, scaleY);
+        float size = Math.max(16f, 28f * cursorScale);
 
         Path cursor = new Path();
         cursor.moveTo(x, y);
@@ -71,7 +69,7 @@ final class CursorOverlayView extends View {
         cursor.lineTo(x + size * 0.64f, y + size * 0.88f);
         cursor.lineTo(x + size * 1.08f, y + size * 0.88f);
         cursor.close();
-        outlinePaint.setStrokeWidth(Math.max(2f, scale * 2.5f));
+        outlinePaint.setStrokeWidth(Math.max(2f, cursorScale * 2.5f));
         canvas.drawPath(cursor, outlinePaint);
         canvas.drawPath(cursor, fillPaint);
     }

@@ -652,6 +652,8 @@ bool SwapChainProcessor::EnsureStagingTextures(UINT width, UINT height)
     m_StagingWidth = 0;
     m_StagingHeight = 0;
     m_StagingWriteIndex = 0;
+    m_HasPendingStagingFrame = false;
+    m_HasPublishedFrame = false;
 
     D3D11_TEXTURE2D_DESC stagingDesc{};
     stagingDesc.Width = width;
@@ -680,20 +682,15 @@ bool SwapChainProcessor::EnsureStagingTextures(UINT width, UINT height)
     return true;
 }
 
-bool SwapChainProcessor::MapAndPublishStagingFrame(
-    UINT stagingIndex,
-    UINT width,
-    UINT height,
-    UINT64 presentDisplayQpcTime,
-    std::uint64_t copyDurationUs)
+bool SwapChainProcessor::MapAndPublishStagingFrame(const PendingStagingFrame& frame)
 {
-    if (stagingIndex >= ARRAYSIZE(m_StagingTextures) ||
-        m_StagingTextures[stagingIndex] == nullptr)
+    if (frame.stagingIndex >= ARRAYSIZE(m_StagingTextures) ||
+        m_StagingTextures[frame.stagingIndex] == nullptr)
     {
         return false;
     }
 
-    ID3D11Texture2D* stagingTexture = m_StagingTextures[stagingIndex].Get();
+    ID3D11Texture2D* stagingTexture = m_StagingTextures[frame.stagingIndex].Get();
     D3D11_MAPPED_SUBRESOURCE mapped{};
     const UINT64 mapStartQpc = QueryQpc();
     const HRESULT mapResult = m_Device->DeviceContext->Map(
@@ -715,7 +712,7 @@ bool SwapChainProcessor::MapAndPublishStagingFrame(
         return false;
     }
 
-    const std::uint64_t captureTimestampUs = QpcToMicroseconds(presentDisplayQpcTime);
+    const std::uint64_t captureTimestampUs = QpcToMicroseconds(frame.presentDisplayQpcTime);
     std::uint64_t timestampUs = captureTimestampUs;
     if (timestampUs == 0)
     {
@@ -736,28 +733,28 @@ bool SwapChainProcessor::MapAndPublishStagingFrame(
     slot->sequence = m_NextSequence++;
     slot->frameId = m_NextFrameId++;
     slot->captureTimestampUs = timestampUs;
-    slot->width = width;
-    slot->height = height;
-    slot->stride = width;
+    slot->width = frame.width;
+    slot->height = frame.height;
+    slot->stride = frame.width;
     slot->payloadLength = static_cast<std::uint32_t>(
-        static_cast<std::size_t>(width) * height * 3 / 2);
+        static_cast<std::size_t>(frame.width) * frame.height * 3 / 2);
     const UINT64 convertStartQpc = QueryQpc();
     const bool convertedWithAvx2 = HasAvx2() && ConvertBgraToNv12Avx2(
-        static_cast<const std::uint8_t*>(mapped.pData),
-        mapped.RowPitch,
-        width,
-        height,
-        slot->payload);
+         static_cast<const std::uint8_t*>(mapped.pData),
+         mapped.RowPitch,
+         frame.width,
+         frame.height,
+         slot->payload);
     if (!convertedWithAvx2)
     {
-        ConvertBgraToNv12(mapped, width, height, slot);
+        ConvertBgraToNv12(mapped, frame.width, frame.height, slot);
     }
     const UINT64 convertEndQpc = QueryQpc();
     m_Device->DeviceContext->Unmap(stagingTexture, 0);
 
     InterlockedExchangeAdd64(
         reinterpret_cast<volatile LONG64*>(&m_FrameRing->telemetry.copyTotalUs),
-        static_cast<LONG64>(copyDurationUs));
+        static_cast<LONG64>(frame.copyDurationUs));
     InterlockedExchangeAdd64(
         reinterpret_cast<volatile LONG64*>(&m_FrameRing->telemetry.mapTotalUs),
         static_cast<LONG64>(QpcDeltaToMicroseconds(mapStartQpc, mapEndQpc)));
@@ -825,6 +822,16 @@ bool SwapChainProcessor::CaptureAndPublish(
         return fail();
     }
 
+    if (m_HasPendingStagingFrame &&
+        (m_StagingWidth != sourceDesc.Width || m_StagingHeight != sourceDesc.Height))
+    {
+        if (!MapAndPublishStagingFrame(m_PendingStagingFrame))
+        {
+            return fail();
+        }
+        m_HasPendingStagingFrame = false;
+    }
+
     if (!EnsureStagingTextures(sourceDesc.Width, sourceDesc.Height))
     {
         return fail();
@@ -845,12 +852,31 @@ bool SwapChainProcessor::CaptureAndPublish(
     }
 
     m_StagingWriteIndex = (writeIndex + 1) % ARRAYSIZE(m_StagingTextures);
-    return MapAndPublishStagingFrame(
+    const PendingStagingFrame currentFrame{
         writeIndex,
         sourceDesc.Width,
         sourceDesc.Height,
         presentDisplayQpcTime,
-        copyDurationUs);
+        copyDurationUs};
+    if (!m_HasPublishedFrame)
+    {
+        if (!MapAndPublishStagingFrame(currentFrame))
+        {
+            return false;
+        }
+        m_HasPublishedFrame = true;
+        return true;
+    }
+    if (m_HasPendingStagingFrame)
+    {
+        if (!MapAndPublishStagingFrame(m_PendingStagingFrame))
+        {
+            return false;
+        }
+    }
+    m_PendingStagingFrame = currentFrame;
+    m_HasPendingStagingFrame = true;
+    return true;
 }
 
 SwapChainProcessor::~SwapChainProcessor()
@@ -926,7 +952,7 @@ void SwapChainProcessor::RunCore()
         if (status == E_PENDING)
         {
             HANDLE waitHandles[] = { m_NewFrameEvent, m_NewCursorEvent, m_TerminateEvent };
-            DWORD waitResult = WaitForMultipleObjects(ARRAYSIZE(waitHandles), waitHandles, FALSE, 16);
+            DWORD waitResult = WaitForMultipleObjects(ARRAYSIZE(waitHandles), waitHandles, FALSE, 4);
             if (waitResult == WAIT_OBJECT_0 || waitResult == WAIT_TIMEOUT)
             {
                 continue;
@@ -945,8 +971,16 @@ void SwapChainProcessor::RunCore()
 
         ComPtr<IDXGIResource> acquiredSurface;
         acquiredSurface.Attach(buffer.MetaData.pSurface);
-        CaptureAndPublish(acquiredSurface, buffer.MetaData.PresentDisplayQPCTime);
+        if (!CaptureAndPublish(acquiredSurface, buffer.MetaData.PresentDisplayQPCTime))
+        {
+            break;
+        }
         acquiredSurface.Reset();
+    }
+    if (m_HasPendingStagingFrame)
+    {
+        MapAndPublishStagingFrame(m_PendingStagingFrame);
+        m_HasPendingStagingFrame = false;
     }
     CloseFrameRing();
 }
