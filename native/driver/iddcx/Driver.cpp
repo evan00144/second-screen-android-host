@@ -649,6 +649,7 @@ bool SwapChainProcessor::EnsureStagingTextures(UINT width, UINT height)
 
     m_StagingTextures[0].Reset();
     m_StagingTextures[1].Reset();
+    WaitForConversionIdle();
     m_StagingWidth = 0;
     m_StagingHeight = 0;
     m_StagingWriteIndex = 0;
@@ -682,25 +683,115 @@ bool SwapChainProcessor::EnsureStagingTextures(UINT width, UINT height)
     return true;
 }
 
-bool SwapChainProcessor::MapAndPublishStagingFrame(const PendingStagingFrame& frame)
+bool SwapChainProcessor::EnsureBgraBuffers(UINT width, UINT height)
 {
-    if (frame.stagingIndex >= ARRAYSIZE(m_StagingTextures) ||
-        m_StagingTextures[frame.stagingIndex] == nullptr)
+    const std::size_t requiredBytes = static_cast<std::size_t>(width) * height * 4;
+    if (requiredBytes == 0)
     {
         return false;
     }
 
-    ID3D11Texture2D* stagingTexture = m_StagingTextures[frame.stagingIndex].Get();
-    D3D11_MAPPED_SUBRESOURCE mapped{};
-    const UINT64 mapStartQpc = QueryQpc();
-    const HRESULT mapResult = m_Device->DeviceContext->Map(
-        stagingTexture,
-        0,
-        D3D11_MAP_READ,
-        0,
-        &mapped);
-    const UINT64 mapEndQpc = QueryQpc();
-    if (FAILED(mapResult))
+    bool buffersReady = m_BgraBufferBytes >= requiredBytes;
+    for (const auto& buffer : m_BgraBuffers)
+    {
+        buffersReady = buffersReady && buffer != nullptr;
+    }
+    if (buffersReady)
+    {
+        return true;
+    }
+
+    WaitForConversionIdle();
+    for (auto& buffer : m_BgraBuffers)
+    {
+        buffer.reset();
+    }
+    m_BgraBufferInUse.fill(false);
+    m_BgraQueueHead = 0;
+    m_BgraQueueCount = 0;
+    m_BgraBufferBytes = 0;
+    for (auto& buffer : m_BgraBuffers)
+    {
+        buffer.reset(new (std::nothrow) std::uint8_t[requiredBytes]);
+        if (buffer == nullptr)
+        {
+            for (auto& allocated : m_BgraBuffers)
+            {
+                allocated.reset();
+            }
+            return false;
+        }
+    }
+    m_BgraBufferBytes = requiredBytes;
+    return true;
+}
+
+bool SwapChainProcessor::AcquireBgraBuffer(UINT& bufferIndex)
+{
+    std::unique_lock<std::mutex> lock(m_BgraMutex);
+    m_BgraSpaceCondition.wait(lock, [this]
+    {
+        if (m_BgraStop || m_BgraFailed)
+        {
+            return true;
+        }
+        for (bool inUse : m_BgraBufferInUse)
+        {
+            if (!inUse)
+            {
+                return true;
+            }
+        }
+        return false;
+    });
+    if (m_BgraStop || m_BgraFailed)
+    {
+        return false;
+    }
+    for (std::size_t index = 0; index < m_BgraBufferInUse.size(); ++index)
+    {
+        if (!m_BgraBufferInUse[index])
+        {
+            m_BgraBufferInUse[index] = true;
+            bufferIndex = static_cast<UINT>(index);
+            return true;
+        }
+    }
+    return false;
+}
+
+void SwapChainProcessor::ReleaseBgraBuffer(UINT bufferIndex) noexcept
+{
+    if (bufferIndex >= m_BgraBufferInUse.size())
+    {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_BgraMutex);
+        m_BgraBufferInUse[bufferIndex] = false;
+    }
+    m_BgraSpaceCondition.notify_all();
+}
+
+bool SwapChainProcessor::EnqueueBgraFrame(const PendingBgraFrame& frame)
+{
+    std::lock_guard<std::mutex> lock(m_BgraMutex);
+    if (m_BgraStop || m_BgraFailed || m_BgraQueueCount >= m_BgraQueue.size())
+    {
+        return false;
+    }
+    const std::size_t queueIndex = (m_BgraQueueHead + m_BgraQueueCount) % m_BgraQueue.size();
+    m_BgraQueue[queueIndex] = frame;
+    ++m_BgraQueueCount;
+    m_BgraReadyCondition.notify_one();
+    return true;
+}
+
+bool SwapChainProcessor::PublishBgraFrame(const PendingBgraFrame& frame)
+{
+    if (frame.bufferIndex >= m_BgraBuffers.size() ||
+        m_BgraBuffers[frame.bufferIndex] == nullptr ||
+        m_FrameRing == nullptr)
     {
         return false;
     }
@@ -708,7 +799,6 @@ bool SwapChainProcessor::MapAndPublishStagingFrame(const PendingStagingFrame& fr
     FrameSlot* slot = ClaimFrameSlot(m_FrameRing);
     if (slot == nullptr)
     {
-        m_Device->DeviceContext->Unmap(stagingTexture, 0);
         return false;
     }
 
@@ -723,7 +813,6 @@ bool SwapChainProcessor::MapAndPublishStagingFrame(const PendingStagingFrame& fr
     }
     if (timestampUs == 0)
     {
-        m_Device->DeviceContext->Unmap(stagingTexture, 0);
         InterlockedExchange(
             reinterpret_cast<volatile LONG*>(&slot->state),
             UsbMonitorFrameRing::kSlotFree);
@@ -740,24 +829,26 @@ bool SwapChainProcessor::MapAndPublishStagingFrame(const PendingStagingFrame& fr
         static_cast<std::size_t>(frame.width) * frame.height * 3 / 2);
     const UINT64 convertStartQpc = QueryQpc();
     const bool convertedWithAvx2 = HasAvx2() && ConvertBgraToNv12Avx2(
-         static_cast<const std::uint8_t*>(mapped.pData),
-         mapped.RowPitch,
-         frame.width,
-         frame.height,
-         slot->payload);
+        m_BgraBuffers[frame.bufferIndex].get(),
+        static_cast<std::size_t>(frame.width) * 4,
+        frame.width,
+        frame.height,
+        slot->payload);
     if (!convertedWithAvx2)
     {
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        mapped.pData = m_BgraBuffers[frame.bufferIndex].get();
+        mapped.RowPitch = frame.width * 4;
         ConvertBgraToNv12(mapped, frame.width, frame.height, slot);
     }
     const UINT64 convertEndQpc = QueryQpc();
-    m_Device->DeviceContext->Unmap(stagingTexture, 0);
 
     InterlockedExchangeAdd64(
         reinterpret_cast<volatile LONG64*>(&m_FrameRing->telemetry.copyTotalUs),
         static_cast<LONG64>(frame.copyDurationUs));
     InterlockedExchangeAdd64(
         reinterpret_cast<volatile LONG64*>(&m_FrameRing->telemetry.mapTotalUs),
-        static_cast<LONG64>(QpcDeltaToMicroseconds(mapStartQpc, mapEndQpc)));
+        static_cast<LONG64>(frame.mapDurationUs));
     InterlockedExchangeAdd64(
         reinterpret_cast<volatile LONG64*>(&m_FrameRing->telemetry.convertTotalUs),
         static_cast<LONG64>(QpcDeltaToMicroseconds(convertStartQpc, convertEndQpc)));
@@ -769,10 +860,177 @@ bool SwapChainProcessor::MapAndPublishStagingFrame(const PendingStagingFrame& fr
         UsbMonitorFrameRing::kSlotReady);
     if (!SetEvent(m_FrameReadyEvent))
     {
-        CloseFrameRing();
+        InterlockedExchange(
+            reinterpret_cast<volatile LONG*>(&slot->state),
+            UsbMonitorFrameRing::kSlotFree);
         return false;
     }
     return true;
+}
+
+bool SwapChainProcessor::MapAndQueueStagingFrame(const PendingStagingFrame& frame)
+{
+    if (frame.stagingIndex >= ARRAYSIZE(m_StagingTextures) ||
+        m_StagingTextures[frame.stagingIndex] == nullptr ||
+        !EnsureBgraBuffers(frame.width, frame.height))
+    {
+        return false;
+    }
+
+    UINT bufferIndex = 0;
+    if (!AcquireBgraBuffer(bufferIndex))
+    {
+        return false;
+    }
+
+    ID3D11Texture2D* stagingTexture = m_StagingTextures[frame.stagingIndex].Get();
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    const UINT64 mapStartQpc = QueryQpc();
+    const HRESULT mapResult = m_Device->DeviceContext->Map(
+        stagingTexture,
+        0,
+        D3D11_MAP_READ,
+        0,
+        &mapped);
+    const UINT64 mapEndQpc = QueryQpc();
+    if (FAILED(mapResult))
+    {
+        ReleaseBgraBuffer(bufferIndex);
+        return false;
+    }
+
+    const std::size_t rowBytes = static_cast<std::size_t>(frame.width) * 4;
+    auto* destination = m_BgraBuffers[bufferIndex].get();
+    const auto* source = static_cast<const std::uint8_t*>(mapped.pData);
+    if (mapped.RowPitch == rowBytes)
+    {
+        std::memcpy(destination, source, rowBytes * frame.height);
+    }
+    else
+    {
+        for (UINT row = 0; row < frame.height; ++row)
+        {
+            std::memcpy(
+                destination + static_cast<std::size_t>(row) * rowBytes,
+                source + static_cast<std::size_t>(row) * mapped.RowPitch,
+                rowBytes);
+        }
+    }
+    m_Device->DeviceContext->Unmap(stagingTexture, 0);
+
+    const PendingBgraFrame bgraFrame{
+        bufferIndex,
+        frame.width,
+        frame.height,
+        frame.presentDisplayQpcTime,
+        frame.copyDurationUs,
+        QpcDeltaToMicroseconds(mapStartQpc, mapEndQpc)};
+    if (!m_HasPublishedFrame)
+    {
+        const bool published = PublishBgraFrame(bgraFrame);
+        ReleaseBgraBuffer(bufferIndex);
+        return published;
+    }
+
+    if (!EnqueueBgraFrame(bgraFrame))
+    {
+        ReleaseBgraBuffer(bufferIndex);
+        return false;
+    }
+    return true;
+}
+
+void SwapChainProcessor::ConversionThreadMain()
+{
+    for (;;)
+    {
+        PendingBgraFrame frame{};
+        {
+            std::unique_lock<std::mutex> lock(m_BgraMutex);
+            m_BgraReadyCondition.wait(lock, [this]
+            {
+                return m_BgraStop || m_BgraFailed || m_BgraQueueCount != 0;
+            });
+            if (m_BgraFailed || (m_BgraStop && m_BgraQueueCount == 0))
+            {
+                return;
+            }
+            frame = m_BgraQueue[m_BgraQueueHead];
+            m_BgraQueueHead = (m_BgraQueueHead + 1) % m_BgraQueue.size();
+            --m_BgraQueueCount;
+        }
+        m_BgraSpaceCondition.notify_all();
+
+        if (!PublishBgraFrame(frame))
+        {
+            {
+                std::lock_guard<std::mutex> lock(m_BgraMutex);
+                m_BgraFailed = true;
+                m_BgraStop = true;
+            }
+            ReleaseBgraBuffer(frame.bufferIndex);
+            m_BgraReadyCondition.notify_all();
+            m_BgraSpaceCondition.notify_all();
+            SetEvent(m_TerminateEvent);
+            return;
+        }
+        ReleaseBgraBuffer(frame.bufferIndex);
+    }
+}
+
+bool SwapChainProcessor::StartConversionThread()
+{
+    try
+    {
+        m_BgraThread = std::thread(&SwapChainProcessor::ConversionThreadMain, this);
+    }
+    catch (...)
+    {
+        return false;
+    }
+    return true;
+}
+
+void SwapChainProcessor::StopConversionThread() noexcept
+{
+    {
+        std::lock_guard<std::mutex> lock(m_BgraMutex);
+        m_BgraStop = true;
+    }
+    m_BgraReadyCondition.notify_all();
+    m_BgraSpaceCondition.notify_all();
+    if (m_BgraThread.joinable())
+    {
+        m_BgraThread.join();
+    }
+}
+
+void SwapChainProcessor::WaitForConversionIdle() noexcept
+{
+    if (!m_BgraThread.joinable())
+    {
+        return;
+    }
+    std::unique_lock<std::mutex> lock(m_BgraMutex);
+    m_BgraSpaceCondition.wait(lock, [this]
+    {
+        if (m_BgraFailed)
+        {
+            return true;
+        }
+        if (m_BgraQueueCount != 0)
+        {
+            return false;
+        }
+        for (bool inUse : m_BgraBufferInUse)
+        {
+            if (inUse)
+            {
+                return false;
+            }
+        }
+        return true;
+    });
 }
 
 bool SwapChainProcessor::CaptureAndPublish(
@@ -825,7 +1083,7 @@ bool SwapChainProcessor::CaptureAndPublish(
     if (m_HasPendingStagingFrame &&
         (m_StagingWidth != sourceDesc.Width || m_StagingHeight != sourceDesc.Height))
     {
-        if (!MapAndPublishStagingFrame(m_PendingStagingFrame))
+        if (!MapAndQueueStagingFrame(m_PendingStagingFrame))
         {
             return fail();
         }
@@ -833,6 +1091,10 @@ bool SwapChainProcessor::CaptureAndPublish(
     }
 
     if (!EnsureStagingTextures(sourceDesc.Width, sourceDesc.Height))
+    {
+        return fail();
+    }
+    if (!EnsureBgraBuffers(sourceDesc.Width, sourceDesc.Height))
     {
         return fail();
     }
@@ -860,7 +1122,7 @@ bool SwapChainProcessor::CaptureAndPublish(
         copyDurationUs};
     if (!m_HasPublishedFrame)
     {
-        if (!MapAndPublishStagingFrame(currentFrame))
+        if (!MapAndQueueStagingFrame(currentFrame))
         {
             return false;
         }
@@ -869,7 +1131,7 @@ bool SwapChainProcessor::CaptureAndPublish(
     }
     if (m_HasPendingStagingFrame)
     {
-        if (!MapAndPublishStagingFrame(m_PendingStagingFrame))
+        if (!MapAndQueueStagingFrame(m_PendingStagingFrame))
         {
             return false;
         }
@@ -887,6 +1149,7 @@ SwapChainProcessor::~SwapChainProcessor()
         WaitForSingleObject(m_Thread, INFINITE);
         CloseHandle(m_Thread);
     }
+    StopConversionThread();
     CloseFrameRing();
     if (m_TerminateEvent != nullptr)
     {
@@ -945,6 +1208,11 @@ void SwapChainProcessor::RunCore()
         QueryHardwareCursor();
     }
 
+    if (!StartConversionThread())
+    {
+        return;
+    }
+
     for (;;)
     {
         IDARG_OUT_RELEASEANDACQUIREBUFFER buffer{};
@@ -952,7 +1220,7 @@ void SwapChainProcessor::RunCore()
         if (status == E_PENDING)
         {
             HANDLE waitHandles[] = { m_NewFrameEvent, m_NewCursorEvent, m_TerminateEvent };
-            DWORD waitResult = WaitForMultipleObjects(ARRAYSIZE(waitHandles), waitHandles, FALSE, 4);
+            DWORD waitResult = WaitForMultipleObjects(ARRAYSIZE(waitHandles), waitHandles, FALSE, INFINITE);
             if (waitResult == WAIT_OBJECT_0 || waitResult == WAIT_TIMEOUT)
             {
                 continue;
@@ -979,9 +1247,10 @@ void SwapChainProcessor::RunCore()
     }
     if (m_HasPendingStagingFrame)
     {
-        MapAndPublishStagingFrame(m_PendingStagingFrame);
+        MapAndQueueStagingFrame(m_PendingStagingFrame);
         m_HasPendingStagingFrame = false;
     }
+    StopConversionThread();
     CloseFrameRing();
 }
 

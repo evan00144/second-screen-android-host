@@ -12,7 +12,11 @@
 
 #include "../../shared/FrameRing.h"
 
+#include <array>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
+#include <thread>
 
 namespace UsbMonitorIddCx
 {
@@ -39,6 +43,16 @@ struct PendingStagingFrame
     std::uint64_t copyDurationUs{};
 };
 
+struct PendingBgraFrame
+{
+    UINT bufferIndex{};
+    UINT width{};
+    UINT height{};
+    UINT64 presentDisplayQpcTime{};
+    std::uint64_t copyDurationUs{};
+    std::uint64_t mapDurationUs{};
+};
+
 class SwapChainProcessor
 {
 public:
@@ -59,7 +73,16 @@ private:
     bool EnsureFrameRing();
     void CloseFrameRing() noexcept;
     bool EnsureStagingTextures(UINT width, UINT height);
-    bool MapAndPublishStagingFrame(const PendingStagingFrame& frame);
+    bool EnsureBgraBuffers(UINT width, UINT height);
+    bool MapAndQueueStagingFrame(const PendingStagingFrame& frame);
+    bool PublishBgraFrame(const PendingBgraFrame& frame);
+    bool AcquireBgraBuffer(UINT& bufferIndex);
+    void ReleaseBgraBuffer(UINT bufferIndex) noexcept;
+    bool EnqueueBgraFrame(const PendingBgraFrame& frame);
+    void ConversionThreadMain();
+    bool StartConversionThread();
+    void StopConversionThread() noexcept;
+    void WaitForConversionIdle() noexcept;
     bool CaptureAndPublish(
         ComPtr<IDXGIResource>& surface,
         UINT64 presentDisplayQpcTime);
@@ -75,6 +98,18 @@ private:
     HANDLE m_FrameReadyEvent{};
     UsbMonitorFrameRing::FrameRing* m_FrameRing{};
     ComPtr<ID3D11Texture2D> m_StagingTextures[2];
+    std::array<std::unique_ptr<std::uint8_t[]>, 3> m_BgraBuffers{};
+    std::array<bool, 3> m_BgraBufferInUse{};
+    std::array<PendingBgraFrame, 3> m_BgraQueue{};
+    std::size_t m_BgraQueueHead{};
+    std::size_t m_BgraQueueCount{};
+    std::size_t m_BgraBufferBytes{};
+    std::mutex m_BgraMutex;
+    std::condition_variable m_BgraReadyCondition;
+    std::condition_variable m_BgraSpaceCondition;
+    std::thread m_BgraThread;
+    bool m_BgraStop{};
+    bool m_BgraFailed{};
     UINT m_StagingWidth{};
     UINT m_StagingHeight{};
     UINT m_StagingWriteIndex{};

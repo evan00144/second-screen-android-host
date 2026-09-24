@@ -175,6 +175,27 @@ Status: implementation complete; runtime validation pending.
 
 Exit condition: idle desktop text input remains responsive without increasing reconnects, send timeouts, or decoder starvation.
 
+## Phase 14: Event-Driven Swap-Chain Wait
+
+Status: implementation complete; runtime validation pending.
+
+- Wait directly on IddCx new-frame, cursor, and termination events instead of polling every 4 ms.
+- Keep fresh-frame cadence telemetry separate from idle refresh cadence.
+- Preserve the existing FrameRing payload and host-side idle refresh fallback.
+
+Exit condition: active capture keeps its existing frame/drop/reconnect behavior with lower driver wakeup overhead.
+
+## Phase 15: Asynchronous CPU Conversion
+
+Status: implementation complete; runtime validation pending.
+
+- Keep D3D11 staging readback on the swap-chain thread, but copy mapped BGRA rows into a bounded three-buffer queue.
+- Convert BGRA to NV12 and publish FrameRing slots on a worker thread.
+- Keep the first frame synchronous, preserve frame order, and drain queued frames during shutdown or resolution changes.
+- Preserve existing copy, map, convert, drop, and reconnect telemetry.
+
+Exit condition: active capture improves toward 55 FPS with no increase in queue drops, send timeouts, or reconnects.
+
 ## Commit Sequence
 
 1. `Add stream telemetry summaries`
