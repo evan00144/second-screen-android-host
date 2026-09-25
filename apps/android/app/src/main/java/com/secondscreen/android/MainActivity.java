@@ -19,6 +19,7 @@ import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.FrameLayout;
 import android.widget.TextView;
+import android.util.Log;
 
 import java.util.Locale;
 
@@ -46,6 +47,8 @@ public final class MainActivity extends Activity implements ConnectionManager.Li
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        Log.i("SecondScreenBuild", "version=" + BuildConfig.VERSION_NAME
+                + " versionCode=" + BuildConfig.VERSION_CODE + " phase=16");
         setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
         connectionManager = new ConnectionManager(this, this);
         buildContentView();

@@ -196,6 +196,19 @@ Status: implementation complete; runtime validation pending.
 
 Exit condition: active capture improves toward 55 FPS with no increase in queue drops, send timeouts, or reconnects.
 
+## Phase 16: Release Hardening
+
+Status: implementation complete; soak validation pending.
+
+- Add `version.json` as the release source of truth for host, driver, and Android metadata.
+- Stamp host and Android startup logs with the Phase 16 build identity.
+- Prevent concurrent host processes from racing on the shared FrameRing and clear stale ready-event state on restart.
+- Add targeted `scripts/phase16-release.ps1` flows for Windows host/driver and Android APK build/install/verification.
+- Add `scripts/phase16-check.ps1` for PnP, package, host, TCP, ADB reverse, and Android log health checks.
+- Add `scripts/phase16-diagnostics.ps1` for host, driver, system, ADB, and filtered logcat bundles.
+
+Exit condition: a fresh install/update plus a 30–60 minute soak passes with `input_starvation=0`, `drop_delta=0`, `send_timeout=0`, active stream at least 49 FPS, and no reconnect increase.
+
 ## Commit Sequence
 
 1. `Add stream telemetry summaries`

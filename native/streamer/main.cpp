@@ -17,6 +17,7 @@
 #include <wrl/client.h>
 
 #include "FrameRing.h"
+#include "BuildInfo.h"
 
 #include <algorithm>
 #include <array>
@@ -1008,6 +1009,22 @@ public:
         securityAttributes.lpSecurityDescriptor = securityDescriptor;
         securityAttributes.bInheritHandle = FALSE;
 
+        HANDLE hostMutex = CreateMutexW(
+            &securityAttributes,
+            FALSE,
+            UsbMonitorFrameRing::kHostMutexName);
+        const DWORD mutexError = GetLastError();
+        if (hostMutex == nullptr) {
+            LocalFree(securityDescriptor);
+            ThrowWin32(mutexError, "CreateMutexW(FrameRingHost)");
+        }
+        if (mutexError == ERROR_ALREADY_EXISTS) {
+            CloseHandle(hostMutex);
+            LocalFree(securityDescriptor);
+            throw std::runtime_error("another second-screen-host process already owns the shared FrameRing; stop it before starting a new host");
+        }
+        hostMutex_.Reset(hostMutex);
+
         const std::uint64_t mappingSize = sizeof(UsbMonitorFrameRing::FrameRing);
         HANDLE mapping = CreateFileMappingW(
             INVALID_HANDLE_VALUE,
@@ -1025,7 +1042,7 @@ public:
             ThrowWin32(mappingError, "CreateFileMappingW(FrameRing)");
         }
         if (mappingError == ERROR_ALREADY_EXISTS) {
-            std::cerr << "[WARN] reusing existing FrameRing mapping\n";
+            std::cerr << "[IPC] reusing existing FrameRing mapping; resetting shared state\n";
         }
 
         HANDLE frameReadyEvent = CreateEventW(
@@ -1042,7 +1059,11 @@ public:
             ThrowWin32(eventError, "CreateEventW(FrameReady)");
         }
         if (eventError == ERROR_ALREADY_EXISTS) {
-            std::cerr << "[WARN] reusing existing FrameReady event\n";
+            if (!ResetEvent(frameReadyEvent)) {
+                const DWORD error = GetLastError();
+                ThrowWin32(error, "ResetEvent(FrameReady)");
+            }
+            std::cerr << "[IPC] reusing existing FrameReady event; cleared stale signal\n";
         }
 
         ring_ = static_cast<UsbMonitorFrameRing::FrameRing*>(MapViewOfFile(
@@ -1087,6 +1108,7 @@ public:
     HANDLE frameReadyEvent() const { return event_.get(); }
 
 private:
+    ScopedHandle hostMutex_;
     ScopedHandle mapping_;
     ScopedHandle event_;
     UsbMonitorFrameRing::FrameRing* ring_ = nullptr;
@@ -3738,6 +3760,10 @@ int main(int argc, char** argv) {
         PrintUsage();
         return 0;
     }
+
+    std::cout << "[BUILD] host=" << UsbMonitorBuild::kVersion
+              << " phase=" << UsbMonitorBuild::kPhase
+              << " build=" << UsbMonitorBuild::kHostBuild << '\n';
 
     if (!SetConsoleCtrlHandler(ConsoleControlHandler, TRUE)) {
         std::cerr << "[ERROR] SetConsoleCtrlHandler failed: " << GetLastError() << '\n';

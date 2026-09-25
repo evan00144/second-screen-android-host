@@ -17,6 +17,9 @@
 /apps/android/app/build/
 *.apk
 
+# Phase 16 diagnostic bundles
+/diagnostics/
+
 # IDE and local files
 .vs/
 .vscode/

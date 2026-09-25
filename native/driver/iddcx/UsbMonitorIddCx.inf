@@ -9,7 +9,7 @@ ClassGUID={4D36E968-E325-11CE-BFC1-08002BE10318}
 ClassVer=2.0
 Provider=%ManufacturerName%
 CatalogFile=UsbMonitorIddCx.cat
-DriverVer=09/21/2026,1.0.0.0
+DriverVer=09/25/2026,1.16.0.0
 PnpLockDown=1
 
 [Manufacturer]

@@ -2,6 +2,8 @@ plugins {
     id 'com.android.application'
 }
 
+def releaseMetadata = new groovy.json.JsonSlurper().parse(rootProject.file('../../version.json'))
+
 android {
     namespace 'com.secondscreen.android'
     compileSdk 35
@@ -9,9 +11,13 @@ android {
     defaultConfig {
         applicationId 'com.secondscreen.android'
         minSdk 29
-        targetSdk 35
-        versionCode 1
-        versionName '0.1.0'
+    targetSdk 35
+        versionCode releaseMetadata.versionCode as int
+        versionName releaseMetadata.version as String
+    }
+
+    buildFeatures {
+        buildConfig true
     }
 
     compileOptions {

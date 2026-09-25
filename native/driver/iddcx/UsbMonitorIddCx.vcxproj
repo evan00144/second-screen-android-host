@@ -98,7 +98,10 @@
     </ClCompile>
     <ClInclude Include="Avx2Convert.h" />
     <ClInclude Include="Driver.h" />
-    <Inf Include="UsbMonitorIddCx.inf" />
+    <Inf Include="UsbMonitorIddCx.inf">
+      <SpecifyDriverVerDirectiveDate>false</SpecifyDriverVerDirectiveDate>
+      <SpecifyDriverVerDirectiveVersion>false</SpecifyDriverVerDirectiveVersion>
+    </Inf>
     <FilesToPackage Include="$(TargetPath)" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

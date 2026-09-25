@@ -23,6 +23,7 @@ constexpr std::int32_t kSlotReading = 3;
 // Global is required because UMDF WUDFHost runs in session 0 while the host is interactive.
 constexpr wchar_t kMappingName[] = L"Global\\UsbMonitorTransport.FrameRing.v1";
 constexpr wchar_t kFrameReadyEventName[] = L"Global\\UsbMonitorTransport.FrameReady.v1";
+constexpr wchar_t kHostMutexName[] = L"Global\\UsbMonitorTransport.FrameRingHost.v1";
 
 struct alignas(64) FrameSlot
 {
